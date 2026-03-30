@@ -36,7 +36,7 @@ void setup()
 
   particleSensor.setup();
 
-  // ✅ 안정적인 LED 세기
+  // 안정적인 LED 세기
   particleSensor.setPulseAmplitudeRed(0x0F);
   particleSensor.setPulseAmplitudeIR(0x0F);
 
