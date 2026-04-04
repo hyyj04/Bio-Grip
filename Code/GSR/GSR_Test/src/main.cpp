@@ -1,6 +1,6 @@
 #include <Arduino.h>
 
-const int GSR_PIN = A0;
+const int GSR_PIN = A0; // 핀 설정
 float filtered = 0;
 
 void setup() {
