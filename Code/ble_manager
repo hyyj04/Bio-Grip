@@ -1,0 +1,56 @@
+import asyncio
+from bleak import BleakScanner, BleakClient
+
+SERVICE_UUID = "12345678-1234-1234-1234-123456789abc"
+CHAR_UUID = "abcd1234-ab12-ab12-ab12-abcdef123456"
+
+class BLEManager:
+    def __init__(self, data_callback):
+        self.data_callback = data_callback
+        self.client = None
+        self.connected = False
+
+    async def scan_and_connect(self):
+        print("BLE 스캔 중...")
+        devices = await BleakScanner.discover(timeout=10.0)
+
+        target = None
+        for d in devices:
+            if d.name and ("BioClick" in d.name or "Arduino" in d.name):
+                target = d
+                return await self._connect_target(target)
+
+        print("BioClick 장치를 찾지 못했어요.")
+        return False
+
+    async def _connect_target(self, target):
+        try:
+            print(f"장치 발견: {target.name} ({target.address})")
+
+            self.client = BleakClient(target.address)
+            await self.client.connect()
+            self.connected = True
+            print("BLE 연결 성공!")
+
+            await self.client.start_notify(CHAR_UUID, self.on_data_received)
+            return True
+
+        except Exception as e:
+            print(f"BLE 연결 오류: {e}")
+            self.connected = False
+            self.client = None
+            return False
+
+    def on_data_received(self, sender, data):
+        try:
+            if len(data) < 4:
+                print("수신 데이터 길이 부족")
+                return
+
+            ppg = int.from_bytes(data[0:2], byteorder='big')
+            gsr = int.from_bytes(data[2:4], byteorder='big')
+
+            ppg_normalized = (ppg / 512.0) - 1.0
+            gsr_normalized = (gsr / 512.0) - 1.0
+
+            self.data_callback(ppg_normalized, gsr_normalized)
