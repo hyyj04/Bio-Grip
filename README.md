@@ -1,3 +1,98 @@
-# Bio-Grip
+# Bio Grip  
+**실시간 스트레스 모니터링을 위한 생체신호 측정 마우스 시스템**
 
-MATLAB Data set : https://archive.ics.uci.edu/dataset/465/wesad+wearable+stress+and+affect+detection
+## 1. 프로젝트 개요
+Bio Grip은 사용자가 별도의 웨어러블 장치를 착용하지 않아도, 일상적인 컴퓨터 사용 과정에서 생체신호를 수집하고 스트레스 상태를 실시간으로 모니터링할 수 있도록 설계된 **마우스 통합형 비침습 시스템**이다.  
+
+본 시스템은 마우스 파지부에 **PPG(Photoplethysmography)** 센서와 **GSR(Galvanic Skin Response)** 전극을 내장하여 사용자의 손가락 및 손바닥 접촉을 통해 생체신호를 측정한다. 측정된 신호는 **Arduino Nano 33 BLE** 기반 마이크로컨트롤러에서 전처리 및 지표 계산이 수행되며, 이후 BLE 통신을 통해 PC 프로그램으로 전달된다.  
+
+이를 통해 사용자는 기존 입력 장치를 사용하는 자연스러운 환경 속에서 스트레스 상태를 지속적으로 확인할 수 있다.
+
+---
+
+## 2. 프로젝트 목적
+기존의 스트레스 측정 방식은 주로 웨어러블 장치나 설문 기반 평가에 의존한다. 그러나 이러한 방식은 다음과 같은 한계를 가진다.
+
+- 웨어러블 장치는 장시간 착용 시 불편함이 존재함
+- 설문 기반 평가는 주관적 판단에 의존하여 객관성이 부족함
+- 일상적인 작업 환경에서 지속적이고 자연스러운 측정이 어려움
+
+Bio Grip은 이러한 한계를 해결하기 위해, 사용자가 이미 익숙하게 사용하는 **마우스**에 생체신호 센서를 통합하여 **무구속적이고 연속적인 스트레스 모니터링 환경**을 제공하는 것을 목표로 한다.
+
+---
+
+## 3. 주요 기능
+- **PPG 센서 기반 심혈관 신호 측정**
+  - 심박 및 심박변이도(HRV) 관련 지표 추출
+- **GSR 센서 기반 피부전도 반응 측정**
+  - 스트레스에 따른 피부전도 변화 분석
+- **MCU 내 실시간 신호 전처리 및 특징 추출**
+  - 원시 데이터 전체를 전송하지 않고 필요한 지표만 계산
+- **BLE 기반 무선 데이터 전송**
+  - 측정 지표를 PC 프로그램으로 전달
+- **PC 프로그램 기반 스트레스 시각화**
+  - 사용자 상태를 직관적으로 확인할 수 있는 인터페이스 제공
+
+---
+
+## 4. 시스템 구성
+### 4.1 Hardware
+- **MCU**: Arduino Nano 33 BLE
+- **PPG Sensor**: MAX30102
+- **GSR Sensor**: Grove GSR Sensor
+- **Input Device**: 유선 마우스 기반 커스텀 하드웨어
+
+### 4.2 Software
+- **Firmware**: Arduino IDE / PlatformIO
+- **Signal Processing**: Embedded C/C++, MATLAB
+- **Communication**: BLE (Bluetooth Low Energy)
+- **PC Application**: 추후 연동 예정
+
+---
+
+## 5. 시스템 동작 흐름
+1. 사용자가 마우스를 파지함  
+2. PPG 센서와 GSR 전극이 생체신호를 측정함  
+3. Arduino Nano 33 BLE가 신호를 수집하고 전처리함  
+4. MCU 내부에서 스트레스 관련 특징값을 계산함  
+5. 계산된 지표를 BLE를 통해 PC 프로그램으로 전송함  
+6. PC에서 사용자 상태를 시각적으로 표시함  
+
+---
+
+## 6. 측정 지표
+### PPG 기반 지표
+- Mean HR
+- SDNN
+- RMSSD
+- LF/HF Ratio
+- Baevsky Stress Index
+
+### GSR 기반 지표
+- SCL Mean
+- NS-SCR Frequency
+- SCR Amplitude
+- SCR Rise Time
+- EDASymp
+- TVSymp
+
+---
+
+## 7. 기대 효과
+- 별도 착용 장치 없이 **자연스러운 생체신호 측정** 가능
+- 컴퓨터 사용 중 **실시간 스트레스 상태 모니터링** 가능
+- 사용자의 생리적 상태 변화를 기반으로 한 **객관적 평가** 가능
+- 향후 산업 안전, 집중도 관리, 피로도 평가, 디지털 헬스케어 등 다양한 분야로 확장 가능
+
+---
+
+## 8. 프로젝트 구조
+```bash
+Bio-Grip/
+├── firmware/              # Arduino Nano 33 BLE 펌웨어 코드
+├── hardware/              # 회로도, 배선도, 기구 설계 관련 자료
+├── docs/                  # 보고서, 발표자료, 참고 문서
+├── matlab/                # 신호 분석 및 검증용 MATLAB 코드
+├── app/                   # PC 프로그램 관련 코드
+├── data/                  # 실험 데이터 및 예제 데이터
+└── README.md
