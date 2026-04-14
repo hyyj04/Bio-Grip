@@ -368,7 +368,7 @@ class MainWindow(QMainWindow):
                 self.ble_thread.wait(3000)
 
         except Exception as e:
-            print(f"종료 처리 오류: {e}")
+            print(f"종: {e}")
 
         event.accept()
 
@@ -377,4 +377,4 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec_()) 
