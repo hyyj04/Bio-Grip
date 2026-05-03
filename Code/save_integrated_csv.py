@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 # ==============================
 # 1. 사용자 설정
 # ==============================
-SERIAL_PORT = "COM3"
+SERIAL_PORT = "COM9"
 BAUD_RATE = 115200
 
 # None이면 사용자가 Ctrl+C로 직접 종료
