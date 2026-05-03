@@ -32,6 +32,11 @@ INVALID_IBI_THRESHOLD = 0
 # 이전 로그처럼 헤더가 이미 지나간 뒤 데이터만 들어오는 경우를 대비
 START_WITH_BUILTIN_HEADER_IF_DATA_COMES = True
 
+# Python 실행/Serial 연결 시 Arduino를 자동 리셋해서
+# MCU 내부 시간(time_ms), 베이스라인, z-score 계산을 0초부터 다시 시작한다.
+FORCE_ARDUINO_RESET_ON_CONNECT = True
+RESET_BOOT_WAIT_SEC = 3.0
+
 
 # ==============================
 # 2. 통합 Arduino 출력 컬럼
@@ -169,6 +174,7 @@ print(f"BAUD RATE : {BAUD_RATE}")
 print(f"OUTPUT    : {OUTPUT_CSV}")
 print("종료 방법 : Ctrl + C")
 print("주의      : Arduino IDE Serial Monitor / Serial Plotter는 닫아 주세요.")
+print(f"AUTO RESET: {FORCE_ARDUINO_RESET_ON_CONNECT}")
 print("====================================")
 
 
@@ -196,19 +202,33 @@ except serial.SerialException as e:
     print("3. USB 케이블이 연결되어 있는지")
     raise e
 
-# Arduino reset 이후 첫 출력 대기.
-# reset_input_buffer()는 일부 환경에서 Arduino 헤더를 지워버릴 수 있어 사용하지 않는다.
-time.sleep(2)
+if FORCE_ARDUINO_RESET_ON_CONNECT:
+    print("\nArduino 자동 리셋을 수행합니다.")
+    print("이제 MCU time_ms, 베이스라인, z-score 계산이 처음부터 다시 시작됩니다.")
+
+    # 보드가 이전에 출력해 둔 낡은 데이터는 리셋 전에만 비운다.
+    # 리셋 이후에는 헤더가 지워질 수 있으므로 reset_input_buffer()를 다시 호출하지 않는다.
+    ser.reset_input_buffer()
+
+    # 대부분의 Arduino UNO/Nano 계열은 DTR 토글 또는 Serial open 시 자동 리셋된다.
+    # 환경에 따라 한 번 더 토글해 리셋을 강제한다.
+    ser.setDTR(False)
+    time.sleep(0.25)
+    ser.setDTR(True)
+    time.sleep(RESET_BOOT_WAIT_SEC)
+else:
+    # 자동 리셋을 사용하지 않는 경우에도 초기 출력 대기
+    time.sleep(2)
 
 print("\nSerial 연결 완료")
-print("실시간 수신값을 표시하면서 CSV 저장을 시작합니다.")
+print("Arduino header를 기다린 뒤 CSV 저장을 시작합니다.")
 print("측정을 중단하려면 Ctrl + C를 누르세요.\n")
 
 rows = []
 empty_count = 0
 bad_count = 0
 header_seen = False
-start_time = time.time()
+start_time = None
 
 
 # ==============================
@@ -220,9 +240,10 @@ try:
 
         while True:
             raw = ser.readline()
-            pc_elapsed_sec = time.time() - start_time
+            now_pc = time.time()
+            pc_elapsed_sec = 0.0 if start_time is None else now_pc - start_time
 
-            if RECORD_SECONDS is not None and pc_elapsed_sec >= RECORD_SECONDS:
+            if RECORD_SECONDS is not None and start_time is not None and pc_elapsed_sec >= RECORD_SECONDS:
                 print("\n측정 시간 종료")
                 break
 
@@ -256,6 +277,9 @@ try:
                 else:
                     print("Arduino 통합 header 수신 완료")
                 header_seen = True
+                if start_time is None:
+                    start_time = time.time()
+                    print("PC elapsed time 기준점을 Arduino header 수신 시점으로 설정했습니다.")
                 continue
 
             values = [v.strip() for v in line.split(",")]
@@ -264,6 +288,9 @@ try:
             if not header_seen and START_WITH_BUILTIN_HEADER_IF_DATA_COMES:
                 if looks_like_data_row(values):
                     header_seen = True
+                    if start_time is None:
+                        start_time = time.time()
+                        pc_elapsed_sec = 0.0
                     print("Arduino header를 놓친 것으로 판단하여 내장 HEADER로 저장을 시작합니다.")
                 else:
                     print("헤더 대기 중:", line)
