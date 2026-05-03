@@ -1,0 +1,1816 @@
+#include <Wire.h>
+#include "MAX30105.h"
+
+MAX30105 particleSensor;
+
+namespace gsr {
+/*
+  GSR Signal Processing for Arduino IDE
+
+  Version:
+  Dual Baseline + Contact Check + Z-score + Stress Score
+
+  Pipeline:
+  1. Data Acquisition: 10 Hz
+  2. Contact validity check
+  3. Median Filter, N = 3
+  4. SCL baseline: Moving Average, N = 150
+  5. SCR detection baseline: EMA
+  6. Phasic = medianGSR - scrDetectBaseline
+  7. Baseline: 15~60 sec
+  8. Measurement: after 60 sec
+  9. 30 sec feature extraction
+  10. Baseline-based z-score
+  11. GSR stress score
+*/
+
+#define GSR_PIN A0
+
+// =====================
+// CSV output mode
+// =====================
+const bool PRINT_EVERY_SAMPLE = false;
+
+// =====================
+// Sampling parameters
+// =====================
+const unsigned long SAMPLE_INTERVAL_MS = 100;
+const int FS_GSR = 10;
+
+// =====================
+// Contact validity parameters
+// =====================
+const int MIN_VALID_GSR_ADC = 10;
+const int CONTACT_RECOVERY_SAMPLES = 10;
+int contactRecoveryCount = 0;
+
+// =====================
+// Preprocessing parameters
+// =====================
+const int MEDIAN_N = 3;
+const int MA_N = 150;     // 15 sec at 10 Hz
+
+// SCR 검출용 EMA baseline
+const float SCR_BASELINE_ALPHA = 0.02;
+
+// =====================
+// Time section parameters
+// =====================
+const int USER_WARMUP_SEC = 15;
+const int BASELINE_END_SEC = 60;
+const int FEATURE_WINDOW_SEC = 30;
+
+const int MA_FILL_SAMPLES = MA_N;
+const int USER_WARMUP_SAMPLES = USER_WARMUP_SEC * FS_GSR;
+
+const int WARMUP_SAMPLES =
+  (USER_WARMUP_SAMPLES > MA_FILL_SAMPLES) ? USER_WARMUP_SAMPLES : MA_FILL_SAMPLES;
+
+const int BASELINE_END_SAMPLES = BASELINE_END_SEC * FS_GSR;
+const int FEATURE_WINDOW_SAMPLES = FEATURE_WINDOW_SEC * FS_GSR;
+
+// =====================
+// SCR detection parameters
+// =====================
+const float THRESHOLD_K = 2.0;
+const float MIN_SCR_THRESHOLD_ADC = 6.0;
+const float MAX_SCR_THRESHOLD_ADC = 15.0;
+const int REFRACTORY_SAMPLES = 10;
+
+// =====================
+// Z-score / score parameters
+// =====================
+// baseline std가 너무 작을 때 z-score가 폭주하는 것을 방지하기 위한 최소 표준편차
+const float MIN_SCL_STD_FOR_Z = 1.0;
+const float MIN_PHASIC_STD_FOR_Z = 1.0;
+const float MIN_FREQ_STD_FOR_Z = 2.0;
+
+// z-score를 점수화할 때 사용할 scale
+// z=0 -> 50점, z=+1 -> 65점, z=+2 -> 80점, z=+3 -> 95점
+const float Z_SCORE_SCALE = 15.0;
+
+// =====================
+// Median filter variables
+// =====================
+float medBuf[MEDIAN_N] = {0, 0, 0};
+int medIndex = 0;
+bool medFilled = false;
+
+// =====================
+// SCL Moving average variables
+// =====================
+float maBuf[MA_N];
+int maIndex = 0;
+int maCount = 0;
+float maSum = 0.0;
+
+// =====================
+// SCR EMA baseline variables
+// =====================
+float scrDetectBaseline = 0.0;
+bool scrBaselineInitialized = false;
+
+// =====================
+// Last valid signal values
+// =====================
+float lastMedianGsr = 0.0;
+float lastSclBaseline = 0.0;
+float lastScrDetectBaseline = 0.0;
+bool hasValidSignal = false;
+
+// =====================
+// Baseline statistics for threshold
+// phasic 기준
+// =====================
+float baselinePhasicSum = 0.0;
+float baselinePhasicSqSum = 0.0;
+int baselineCount = 0;
+
+float baselinePhasicMean = 0.0;
+float baselinePhasicStd = 0.0;
+
+// =====================
+// Baseline statistics for z-score
+// =====================
+float baselineSclSum = 0.0;
+float baselineSclSqSum = 0.0;
+int baselineSclCount = 0;
+
+float baselineSclMean = 0.0;
+float baselineSclStd = 0.0;
+
+float baselinePhasicPosSum = 0.0;
+float baselinePhasicPosSqSum = 0.0;
+int baselinePhasicPosCount = 0;
+
+float baselinePhasicPosMean = 0.0;
+float baselinePhasicPosStd = 0.0;
+
+// NS-SCR Frequency는 baseline 안정 상태에서 0에 가깝게 보는 구조
+float baselineNsScrFreqMean = 0.0;
+float baselineNsScrFreqStd = MIN_FREQ_STD_FOR_Z;
+
+// =====================
+// Threshold
+// =====================
+float scrThreshold = MIN_SCR_THRESHOLD_ADC;
+bool baselineReady = false;
+
+// =====================
+// Feature window variables
+// =====================
+float windowSclSum = 0.0;
+int windowSampleCount = 0;
+
+float windowScrAmpSum = 0.0;
+int windowScrCount = 0;
+
+// =====================
+// SCR peak detection variables
+// =====================
+float phasicPrev2 = 0.0;
+float phasicPrev1 = 0.0;
+float phasicCurr = 0.0;
+
+int lastScrSampleIndex = -9999;
+
+int detectedScrSampleIndex = -1;
+unsigned long detectedScrTimeMs = 0;
+
+// =====================
+// Sample time variables
+// =====================
+unsigned long prev2SampleTimeMs = 0;
+unsigned long prev1SampleTimeMs = 0;
+unsigned long currSampleTimeMs = 0;
+
+// =====================
+// General variables
+// =====================
+unsigned long lastSampleTime = 0;
+int sampleIndex = 0;
+
+// =====================
+// Latest GSR values for integrated output
+// =====================
+int latestMode = 0;
+int latestRawGsr = 0;
+int latestSampleIndex = 0;
+int latestContactOk = 0;
+int latestValidSampleFlag = 0;
+float latestMedianGsr = NAN;
+float latestSclBaseline = NAN;
+float latestScrDetectBaseline = NAN;
+float latestPhasic = NAN;
+float latestPhasicPos = NAN;
+float latestSclMean30s = NAN;
+float latestScrAmplitudeMean30s = NAN;
+float latestNsScrFrequencyPerMin = NAN;
+float latestSclMeanZ = NAN;
+float latestScrAmplitudeMeanZ = NAN;
+float latestNsScrFrequencyZ = NAN;
+float latestSclStressScore = NAN;
+float latestScrAmplitudeStressScore = NAN;
+float latestNsScrFrequencyStressScore = NAN;
+float latestFinalGsrStressScore = NAN;
+int latestFeatureReady = 0;
+
+
+// =====================
+// Utility functions
+// =====================
+float median3(float a, float b, float c) {
+  if ((a >= b && a <= c) || (a <= b && a >= c)) return a;
+  if ((b >= a && b <= c) || (b <= a && b >= c)) return b;
+  return c;
+}
+
+float clampFloat(float x, float low, float high) {
+  if (x < low) return low;
+  if (x > high) return high;
+  return x;
+}
+
+float safeStd(float stdVal, float minStd) {
+  if (stdVal < minStd) return minStd;
+  return stdVal;
+}
+
+float computeZScore(float value, float meanVal, float stdVal, float minStd) {
+  float s = safeStd(stdVal, minStd);
+  return (value - meanVal) / s;
+}
+
+float zToStressScore(float z) {
+  float zClamped = clampFloat(z, -3.0, 3.0);
+  float score = 50.0 + (zClamped * Z_SCORE_SCALE);
+  return clampFloat(score, 0.0, 100.0);
+}
+
+float calcMean(float sumVal, int countVal) {
+  if (countVal <= 0) return 0.0;
+  return sumVal / countVal;
+}
+
+float calcStd(float sumVal, float sqSumVal, int countVal) {
+  if (countVal <= 1) return 0.0;
+
+  float meanVal = sumVal / countVal;
+  float variance = (sqSumVal / countVal) - (meanVal * meanVal);
+
+  if (variance < 0.0) {
+    variance = 0.0;
+  }
+
+  return sqrt(variance);
+}
+
+
+// =====================
+// Median filter update
+// =====================
+float updateMedianFilter(float x) {
+  medBuf[medIndex] = x;
+  medIndex++;
+
+  if (medIndex >= MEDIAN_N) {
+    medIndex = 0;
+    medFilled = true;
+  }
+
+  if (!medFilled) {
+    return x;
+  }
+
+  return median3(medBuf[0], medBuf[1], medBuf[2]);
+}
+
+
+// =====================
+// SCL Moving Average update
+// =====================
+float updateMovingAverage(float x) {
+  if (maCount < MA_N) {
+    maBuf[maIndex] = x;
+    maSum += x;
+    maCount++;
+  } else {
+    maSum -= maBuf[maIndex];
+    maBuf[maIndex] = x;
+    maSum += x;
+  }
+
+  maIndex++;
+  if (maIndex >= MA_N) {
+    maIndex = 0;
+  }
+
+  return maSum / maCount;
+}
+
+
+// =====================
+// SCR EMA baseline update
+// =====================
+float updateEmaBaseline(float x) {
+  if (!scrBaselineInitialized) {
+    scrDetectBaseline = x;
+    scrBaselineInitialized = true;
+  } else {
+    scrDetectBaseline =
+      SCR_BASELINE_ALPHA * x +
+      (1.0 - SCR_BASELINE_ALPHA) * scrDetectBaseline;
+  }
+
+  return scrDetectBaseline;
+}
+
+
+// =====================
+// Baseline finalization
+// =====================
+void finalizeBaseline() {
+  baselinePhasicMean = calcMean(baselinePhasicSum, baselineCount);
+  baselinePhasicStd = calcStd(baselinePhasicSum, baselinePhasicSqSum, baselineCount);
+
+  baselineSclMean = calcMean(baselineSclSum, baselineSclCount);
+  baselineSclStd = calcStd(baselineSclSum, baselineSclSqSum, baselineSclCount);
+
+  baselinePhasicPosMean = calcMean(baselinePhasicPosSum, baselinePhasicPosCount);
+  baselinePhasicPosStd = calcStd(baselinePhasicPosSum, baselinePhasicPosSqSum, baselinePhasicPosCount);
+
+  // SCR detection threshold
+  scrThreshold = THRESHOLD_K * baselinePhasicStd;
+
+  if (scrThreshold < MIN_SCR_THRESHOLD_ADC) {
+    scrThreshold = MIN_SCR_THRESHOLD_ADC;
+  }
+
+  if (scrThreshold > MAX_SCR_THRESHOLD_ADC) {
+    scrThreshold = MAX_SCR_THRESHOLD_ADC;
+  }
+
+  // Frequency baseline은 안정 상태에서 0회/min으로 간주
+  baselineNsScrFreqMean = 0.0;
+  baselineNsScrFreqStd = MIN_FREQ_STD_FOR_Z;
+
+  baselineReady = true;
+}
+
+
+// =====================
+// Peak detection buffer reset
+// =====================
+void resetPeakDetectionBuffer() {
+  phasicPrev2 = 0.0;
+  phasicPrev1 = 0.0;
+  phasicCurr = 0.0;
+  lastScrSampleIndex = sampleIndex;
+  detectedScrSampleIndex = -1;
+  detectedScrTimeMs = 0;
+}
+
+
+// =====================
+// CSV header
+// =====================
+void printHeader() {
+  Serial.println(
+    "time_ms,"
+    "sample_index,"
+    "mode,"
+    "raw_gsr,"
+    "median_gsr,"
+    "scl_baseline,"
+    "scr_detect_baseline,"
+    "phasic,"
+    "phasic_pos,"
+    "scr_threshold,"
+    "scr_flag,"
+    "scr_peak_time_ms,"
+    "scr_peak_sample_index,"
+    "scl_mean_30s,"
+    "scr_amplitude_mean_30s,"
+    "ns_scr_frequency_per_min,"
+    "baseline_scl_mean,"
+    "baseline_scl_std,"
+    "baseline_phasic_mean,"
+    "baseline_phasic_std,"
+    "baseline_phasic_pos_mean,"
+    "baseline_phasic_pos_std,"
+    "scl_mean_z,"
+    "scr_amplitude_mean_z,"
+    "ns_scr_frequency_z,"
+    "scl_stress_score,"
+    "scr_amplitude_stress_score,"
+    "ns_scr_frequency_stress_score,"
+    "final_gsr_stress_score,"
+    "feature_ready,"
+    "min_scr_threshold_adc,"
+    "max_scr_threshold_adc,"
+    "contact_ok,"
+    "valid_sample_flag"
+  );
+}
+
+
+// =====================
+// CSV row print
+// =====================
+void printCsvRow(
+  unsigned long timeMs,
+  int sIndex,
+  int mode,
+  int rawGsr,
+  float medianGsr,
+  float sclBaseline,
+  float scrDetectBl,
+  float phasic,
+  float phasicPos,
+  int scrFlag,
+  unsigned long scrPeakTimeMs,
+  int scrPeakSampleIndex,
+  float sclMean30s,
+  float scrAmplitudeMean30s,
+  float nsScrFrequencyPerMin,
+  float sclMeanZ,
+  float scrAmplitudeMeanZ,
+  float nsScrFrequencyZ,
+  float sclStressScore,
+  float scrAmplitudeStressScore,
+  float nsScrFrequencyStressScore,
+  float finalGsrStressScore,
+  int featureReady,
+  int contactOk,
+  int validSampleFlag
+) {
+  // Suppressed in integrated version. Unified CSV is printed by the main PPG loop.
+}
+
+
+
+// =====================
+// Setup
+// =====================
+void setup() {
+  for (int i = 0; i < MA_N; i++) {
+    maBuf[i] = 0.0;
+  }
+
+}
+
+
+// =====================
+// Main loop
+// =====================
+void loop() {
+  unsigned long now = millis();
+
+  if (now - lastSampleTime < SAMPLE_INTERVAL_MS) {
+    return;
+  }
+
+  lastSampleTime = now;
+
+  prev2SampleTimeMs = prev1SampleTimeMs;
+  prev1SampleTimeMs = currSampleTimeMs;
+  currSampleTimeMs = now;
+
+  int mode = 0;
+
+  if (sampleIndex < WARMUP_SAMPLES) {
+    mode = 0;
+  } else if (sampleIndex < BASELINE_END_SAMPLES) {
+    mode = 1;
+  } else {
+    mode = 2;
+  }
+
+  int rawGsr = analogRead(GSR_PIN);
+
+  bool contactOkBool = rawGsr >= MIN_VALID_GSR_ADC;
+  int contactOk = contactOkBool ? 1 : 0;
+
+  latestMode = mode;
+  latestRawGsr = rawGsr;
+  latestSampleIndex = sampleIndex;
+  latestContactOk = contactOk;
+
+  float medianGsr = lastMedianGsr;
+  float sclBaseline = lastSclBaseline;
+  float scrDetectBl = lastScrDetectBaseline;
+
+  float phasic = 0.0;
+  float phasicPos = 0.0;
+
+  int scrFlag = 0;
+  detectedScrSampleIndex = -1;
+  detectedScrTimeMs = 0;
+
+  float sclMean30s = 0.0;
+  float scrAmplitudeMean30s = 0.0;
+  float nsScrFrequencyPerMin = 0.0;
+
+  float sclMeanZ = 0.0;
+  float scrAmplitudeMeanZ = 0.0;
+  float nsScrFrequencyZ = 0.0;
+
+  float sclStressScore = 0.0;
+  float scrAmplitudeStressScore = 0.0;
+  float nsScrFrequencyStressScore = 0.0;
+  float finalGsrStressScore = 0.0;
+
+  int featureReady = 0;
+
+  // baseline 종료 시점 보장
+  if (!baselineReady && sampleIndex >= BASELINE_END_SAMPLES) {
+    finalizeBaseline();
+    resetPeakDetectionBuffer();
+  }
+
+  // 접촉 불량 샘플 처리
+  if (!contactOkBool) {
+    contactRecoveryCount = CONTACT_RECOVERY_SAMPLES;
+
+    if (!hasValidSignal) {
+      medianGsr = 0.0;
+      sclBaseline = 0.0;
+      scrDetectBl = 0.0;
+    }
+
+    latestMedianGsr = medianGsr;
+    latestSclBaseline = sclBaseline;
+    latestScrDetectBaseline = scrDetectBl;
+    latestPhasic = phasic;
+    latestPhasicPos = phasicPos;
+    latestValidSampleFlag = 0;
+    latestFeatureReady = 0;
+
+    if (PRINT_EVERY_SAMPLE) {
+      printCsvRow(
+        now,
+        sampleIndex,
+        mode,
+        rawGsr,
+        medianGsr,
+        sclBaseline,
+        scrDetectBl,
+        phasic,
+        phasicPos,
+        scrFlag,
+        detectedScrTimeMs,
+        detectedScrSampleIndex,
+        sclMean30s,
+        scrAmplitudeMean30s,
+        nsScrFrequencyPerMin,
+        sclMeanZ,
+        scrAmplitudeMeanZ,
+        nsScrFrequencyZ,
+        sclStressScore,
+        scrAmplitudeStressScore,
+        nsScrFrequencyStressScore,
+        finalGsrStressScore,
+        featureReady,
+        contactOk,
+        0
+      );
+    }
+
+    sampleIndex++;
+    return;
+  }
+
+  // Median filter
+  medianGsr = updateMedianFilter((float)rawGsr);
+
+  // Dual baseline
+  sclBaseline = updateMovingAverage(medianGsr);
+  scrDetectBl = updateEmaBaseline(medianGsr);
+
+  lastMedianGsr = medianGsr;
+  lastSclBaseline = sclBaseline;
+  lastScrDetectBaseline = scrDetectBl;
+  hasValidSignal = true;
+
+  int validSampleFlag = 1;
+
+  if (contactRecoveryCount > 0) {
+    contactRecoveryCount--;
+    validSampleFlag = 0;
+  }
+
+  // Phasic
+  phasic = medianGsr - scrDetectBl;
+
+  phasicPos = phasic;
+  if (phasicPos < 0.0) {
+    phasicPos = 0.0;
+  }
+
+  latestMedianGsr = medianGsr;
+  latestSclBaseline = sclBaseline;
+  latestScrDetectBaseline = scrDetectBl;
+  latestPhasic = phasic;
+  latestPhasicPos = phasicPos;
+  latestValidSampleFlag = validSampleFlag;
+  latestFeatureReady = 0;
+
+  // Baseline statistics
+  if (mode == 1 && validSampleFlag == 1) {
+    baselinePhasicSum += phasic;
+    baselinePhasicSqSum += phasic * phasic;
+    baselineCount++;
+
+    baselineSclSum += sclBaseline;
+    baselineSclSqSum += sclBaseline * sclBaseline;
+    baselineSclCount++;
+
+    baselinePhasicPosSum += phasicPos;
+    baselinePhasicPosSqSum += phasicPos * phasicPos;
+    baselinePhasicPosCount++;
+  }
+
+  // SCR peak detection
+  if (mode == 2 && baselineReady && validSampleFlag == 1) {
+    phasicPrev2 = phasicPrev1;
+    phasicPrev1 = phasicCurr;
+    phasicCurr = phasicPos;
+
+    bool localPeak =
+      (phasicPrev1 > phasicPrev2) &&
+      (phasicPrev1 >= phasicCurr);
+
+    bool aboveThreshold =
+      (phasicPrev1 >= scrThreshold) &&
+      (phasicPrev1 > 0.0);
+
+    bool refractoryOk =
+      ((sampleIndex - 1) - lastScrSampleIndex) >= REFRACTORY_SAMPLES;
+
+    if (localPeak && aboveThreshold && refractoryOk) {
+      scrFlag = 1;
+
+      detectedScrSampleIndex = sampleIndex - 1;
+      detectedScrTimeMs = prev1SampleTimeMs;
+
+      lastScrSampleIndex = detectedScrSampleIndex;
+
+      windowScrCount++;
+      windowScrAmpSum += phasicPrev1;
+    }
+  } else {
+    phasicPrev2 = 0.0;
+    phasicPrev1 = 0.0;
+    phasicCurr = 0.0;
+  }
+
+  // Feature window
+  if (mode == 2 && baselineReady && validSampleFlag == 1) {
+    windowSclSum += sclBaseline;
+    windowSampleCount++;
+
+    if (windowSampleCount >= FEATURE_WINDOW_SAMPLES) {
+      featureReady = 1;
+
+      sclMean30s = windowSclSum / windowSampleCount;
+
+      if (windowScrCount > 0) {
+        scrAmplitudeMean30s = windowScrAmpSum / windowScrCount;
+      } else {
+        scrAmplitudeMean30s = 0.0;
+      }
+
+      nsScrFrequencyPerMin =
+        windowScrCount * (60.0 / FEATURE_WINDOW_SEC);
+
+      // =====================
+      // Z-score 계산
+      // =====================
+      sclMeanZ = computeZScore(
+        sclMean30s,
+        baselineSclMean,
+        baselineSclStd,
+        MIN_SCL_STD_FOR_Z
+      );
+
+      scrAmplitudeMeanZ = computeZScore(
+        scrAmplitudeMean30s,
+        baselinePhasicPosMean,
+        baselinePhasicPosStd,
+        MIN_PHASIC_STD_FOR_Z
+      );
+
+      nsScrFrequencyZ = computeZScore(
+        nsScrFrequencyPerMin,
+        baselineNsScrFreqMean,
+        baselineNsScrFreqStd,
+        MIN_FREQ_STD_FOR_Z
+      );
+
+      // =====================
+      // Stress score 계산
+      // =====================
+      sclStressScore = zToStressScore(sclMeanZ);
+      scrAmplitudeStressScore = zToStressScore(scrAmplitudeMeanZ);
+      nsScrFrequencyStressScore = zToStressScore(nsScrFrequencyZ);
+
+      finalGsrStressScore =
+        (sclStressScore +
+         scrAmplitudeStressScore +
+         nsScrFrequencyStressScore) / 3.0;
+
+      latestSclMean30s = sclMean30s;
+      latestScrAmplitudeMean30s = scrAmplitudeMean30s;
+      latestNsScrFrequencyPerMin = nsScrFrequencyPerMin;
+      latestSclMeanZ = sclMeanZ;
+      latestScrAmplitudeMeanZ = scrAmplitudeMeanZ;
+      latestNsScrFrequencyZ = nsScrFrequencyZ;
+      latestSclStressScore = sclStressScore;
+      latestScrAmplitudeStressScore = scrAmplitudeStressScore;
+      latestNsScrFrequencyStressScore = nsScrFrequencyStressScore;
+      latestFinalGsrStressScore = finalGsrStressScore;
+      latestFeatureReady = 1;
+
+      printCsvRow(
+        now,
+        sampleIndex,
+        mode,
+        rawGsr,
+        medianGsr,
+        sclBaseline,
+        scrDetectBl,
+        phasic,
+        phasicPos,
+        scrFlag,
+        detectedScrTimeMs,
+        detectedScrSampleIndex,
+        sclMean30s,
+        scrAmplitudeMean30s,
+        nsScrFrequencyPerMin,
+        sclMeanZ,
+        scrAmplitudeMeanZ,
+        nsScrFrequencyZ,
+        sclStressScore,
+        scrAmplitudeStressScore,
+        nsScrFrequencyStressScore,
+        finalGsrStressScore,
+        featureReady,
+        contactOk,
+        validSampleFlag
+      );
+
+      windowSclSum = 0.0;
+      windowSampleCount = 0;
+      windowScrAmpSum = 0.0;
+      windowScrCount = 0;
+
+      sampleIndex++;
+      return;
+    }
+  }
+
+  if (PRINT_EVERY_SAMPLE) {
+    printCsvRow(
+      now,
+      sampleIndex,
+      mode,
+      rawGsr,
+      medianGsr,
+      sclBaseline,
+      scrDetectBl,
+      phasic,
+      phasicPos,
+      scrFlag,
+      detectedScrTimeMs,
+      detectedScrSampleIndex,
+      sclMean30s,
+      scrAmplitudeMean30s,
+      nsScrFrequencyPerMin,
+      sclMeanZ,
+      scrAmplitudeMeanZ,
+      nsScrFrequencyZ,
+      sclStressScore,
+      scrAmplitudeStressScore,
+      nsScrFrequencyStressScore,
+      finalGsrStressScore,
+      featureReady,
+      contactOk,
+      validSampleFlag
+    );
+  }
+
+  sampleIndex++;
+}
+} // namespace gsr
+
+
+
+// ===============================
+// 1. 샘플링 및 구간 설정
+// ===============================
+const float FS = 100.0;
+const unsigned long SAMPLE_INTERVAL_MS = 10;
+
+const unsigned long STABILIZING_TIME_MS = 5000;
+const unsigned long CALIBRATION_TIME_MS = 60000;
+
+unsigned long startTime = 0;
+unsigned long lastSampleTime = 0;
+unsigned long lastPrintTime = 0;
+
+const unsigned long PRINT_INTERVAL_MS = 1000;
+
+
+// ===============================
+// 2. 손가락 미접촉 판단 설정
+// ===============================
+const long NO_FINGER_IR_THRESHOLD = 10000;
+
+const int NO_FINGER_CONFIRM_COUNT = 10;
+int consecutiveNoFinger = 0;
+
+int noFingerCount = 0;
+
+
+// ===============================
+// 3. Butterworth 필터 계수
+// HPF 0.5 Hz, LPF 8 Hz, Fs 100 Hz
+// ===============================
+
+// HPF
+float b_hp[3] = {0.97803048, -1.95606096, 0.97803048};
+float a_hp[3] = {1.0, -1.95557824, 0.95654368};
+
+// LPF
+float b_lp[3] = {0.0461318, 0.0922636, 0.0461318};
+float a_lp[3] = {1.0, -1.30728503, 0.49181224};
+
+float hp_x1 = 0, hp_x2 = 0;
+float hp_y1 = 0, hp_y2 = 0;
+
+float lp_x1 = 0, lp_x2 = 0;
+float lp_y1 = 0, lp_y2 = 0;
+
+
+// ===============================
+// 4. Peak 검출 및 IBI 설정
+// ===============================
+float ppg_prev2 = 0;
+float ppg_prev1 = 0;
+float ppg_curr = 0;
+
+float abs_ema = 0;
+const float ABS_EMA_ALPHA = 0.01;
+const float PEAK_THRESHOLD_RATIO = 0.35;
+
+unsigned long lastPeakTime = 0;
+const unsigned long REFRACTORY_MS = 300;
+
+// rawIbiMs: peak 간격으로 계산된 원시 IBI
+// validIbiMs: 제2 전처리까지 통과한 유효 IBI
+float rawIbiMs = NAN;
+float validIbiMs = NAN;
+
+const float MIN_IBI_MS = 300.0;
+const float MAX_IBI_MS = 1500.0;
+
+// local median 기반 이상치 제거
+const int MEDIAN_BUF_SIZE = 7;
+float medianBuf[MEDIAN_BUF_SIZE];
+int medianCount = 0;
+int medianIndex = 0;
+
+const float LOCAL_MEDIAN_TOLERANCE = 0.30;
+
+
+// ===============================
+// 5. HRV 계산용 IBI 버퍼
+// ===============================
+const int IBI_BUF_SIZE = 30;
+float ibiBuf[IBI_BUF_SIZE];
+int ibiCount = 0;
+int ibiIndex = 0;
+
+float meanHR = NAN;
+float sdnn = NAN;
+float rmssd = NAN;
+
+
+// ===============================
+// 6. Baseline HRV 계산용 변수
+// ===============================
+int baselineMetricCount = 0;
+
+float baselineMeanHRMean = NAN;
+float baselineMeanHRStd = NAN;
+
+float baselineSDNNMean = NAN;
+float baselineSDNNStd = NAN;
+
+float baselineRMSSDMean = NAN;
+float baselineRMSSDStd = NAN;
+
+float meanHR_m = 0, meanHR_s = 0;
+float sdnn_m = 0, sdnn_s = 0;
+float rmssd_m = 0, rmssd_s = 0;
+
+
+// ===============================
+// 7. Baseline IBI 변동 범위 계산용 변수
+// ===============================
+int baselineIbiCount = 0;
+
+float baselineIbiMean = NAN;
+float baselineIbiStd = NAN;
+
+float baselineIbi_m = 0;
+float baselineIbi_s = 0;
+
+// 마우스 기반 PPG 환경을 고려해 4SD로 완화
+const float BASELINE_IBI_STD_MULT = 4.0;
+
+
+// ===============================
+// 8. SQI window 설정
+// ===============================
+const int SQI_BUF_SIZE = 10;
+const int SQI_MIN_COUNT = 5;
+
+float sqiIbiBuf[SQI_BUF_SIZE];
+float sqiAmpBuf[SQI_BUF_SIZE];
+
+int sqiCount = 0;
+int sqiIndex = 0;
+
+// 마우스 기반 PPG 환경을 고려해 완화한 SQI 기준
+const float MAX_IBI_CV = 0.45;
+const float MAX_AMP_CV = 1.20;
+const float MIN_SQI_SCORE = 45.0;
+
+float currentSQI = NAN;
+int validWindowFlag = 0;
+
+
+// ===============================
+// 9. Z-score 기반 PPG 스트레스 점수 변수
+// ===============================
+float meanHrZ = NAN;
+float sdnnZ = NAN;
+float rmssdZ = NAN;
+
+float meanHrStressScore = NAN;
+float sdnnStressScore = NAN;
+float rmssdStressScore = NAN;
+
+float ppgAvgScore = NAN;
+float hrvScore = NAN;
+float finalPpgStressScore = NAN;
+
+String finalPpgStressLevel = "";
+
+const float MAX_Z_FOR_SCORE = 3.0;
+
+const float NORMAL_THRESHOLD = 33.3;
+const float STRESS_THRESHOLD = 66.7;
+
+const int MIN_BASELINE_METRIC_COUNT_FOR_Z = 10;
+
+
+// ===============================
+// 10. 출력 유틸 함수
+// ===============================
+void printFloatOrEmpty(float x, int digits) {
+  if (isnan(x)) {
+    Serial.print("");
+  } else {
+    Serial.print(x, digits);
+  }
+}
+
+
+// ===============================
+// 11. 필터 함수
+// ===============================
+float applyHPF(float x) {
+  float y = b_hp[0] * x + b_hp[1] * hp_x1 + b_hp[2] * hp_x2
+            - a_hp[1] * hp_y1 - a_hp[2] * hp_y2;
+
+  hp_x2 = hp_x1;
+  hp_x1 = x;
+  hp_y2 = hp_y1;
+  hp_y1 = y;
+
+  return y;
+}
+
+
+float applyLPF(float x) {
+  float y = b_lp[0] * x + b_lp[1] * lp_x1 + b_lp[2] * lp_x2
+            - a_lp[1] * lp_y1 - a_lp[2] * lp_y2;
+
+  lp_x2 = lp_x1;
+  lp_x1 = x;
+  lp_y2 = lp_y1;
+  lp_y1 = y;
+
+  return y;
+}
+
+
+float applyBandpass(float x) {
+  float hp = applyHPF(x);
+  float lp = applyLPF(hp);
+  return lp;
+}
+
+
+// ===============================
+// 12. 통계 함수
+// ===============================
+float calcMean(float arr[], int n) {
+  if (n <= 0) return NAN;
+
+  float sum = 0;
+  for (int i = 0; i < n; i++) {
+    sum += arr[i];
+  }
+
+  return sum / n;
+}
+
+
+float calcStd(float arr[], int n) {
+  if (n < 2) return NAN;
+
+  float m = calcMean(arr, n);
+  float sumSq = 0;
+
+  for (int i = 0; i < n; i++) {
+    float d = arr[i] - m;
+    sumSq += d * d;
+  }
+
+  return sqrt(sumSq / (n - 1));
+}
+
+
+float calcMedian(float arr[], int n) {
+  if (n <= 0) return NAN;
+
+  float temp[MEDIAN_BUF_SIZE];
+
+  for (int i = 0; i < n; i++) {
+    temp[i] = arr[i];
+  }
+
+  for (int i = 0; i < n - 1; i++) {
+    for (int j = i + 1; j < n; j++) {
+      if (temp[j] < temp[i]) {
+        float t = temp[i];
+        temp[i] = temp[j];
+        temp[j] = t;
+      }
+    }
+  }
+
+  if (n % 2 == 1) {
+    return temp[n / 2];
+  } else {
+    return (temp[n / 2 - 1] + temp[n / 2]) / 2.0;
+  }
+}
+
+
+float calcCV(float arr[], int n) {
+  if (n < 2) return NAN;
+
+  float meanValue = calcMean(arr, n);
+  float stdValue = calcStd(arr, n);
+
+  if (isnan(meanValue) || meanValue == 0) return NAN;
+  if (isnan(stdValue)) return NAN;
+
+  return stdValue / meanValue;
+}
+
+
+float clampFloat(float x, float low, float high) {
+  if (x < low) return low;
+  if (x > high) return high;
+  return x;
+}
+
+
+// ===============================
+// 13. Welford baseline 계산 함수
+// ===============================
+void updateWelford(float x, int n, float &m, float &s) {
+  float delta = x - m;
+  m += delta / n;
+  float delta2 = x - m;
+  s += delta * delta2;
+}
+
+
+void updateBaselineMetrics() {
+  if (isnan(meanHR) || isnan(sdnn) || isnan(rmssd)) {
+    return;
+  }
+
+  baselineMetricCount++;
+
+  updateWelford(meanHR, baselineMetricCount, meanHR_m, meanHR_s);
+  updateWelford(sdnn, baselineMetricCount, sdnn_m, sdnn_s);
+  updateWelford(rmssd, baselineMetricCount, rmssd_m, rmssd_s);
+
+  baselineMeanHRMean = meanHR_m;
+  baselineSDNNMean = sdnn_m;
+  baselineRMSSDMean = rmssd_m;
+
+  if (baselineMetricCount >= 2) {
+    baselineMeanHRStd = sqrt(meanHR_s / (baselineMetricCount - 1));
+    baselineSDNNStd = sqrt(sdnn_s / (baselineMetricCount - 1));
+    baselineRMSSDStd = sqrt(rmssd_s / (baselineMetricCount - 1));
+  }
+}
+
+
+// baseline IBI는 basic IBI 검사를 통과한 CALIBRATION IBI로 먼저 형성
+void updateBaselineIbi(float ibi) {
+  if (isnan(ibi)) return;
+
+  baselineIbiCount++;
+
+  float delta = ibi - baselineIbi_m;
+  baselineIbi_m += delta / baselineIbiCount;
+  float delta2 = ibi - baselineIbi_m;
+  baselineIbi_s += delta * delta2;
+
+  baselineIbiMean = baselineIbi_m;
+
+  if (baselineIbiCount >= 2) {
+    baselineIbiStd = sqrt(baselineIbi_s / (baselineIbiCount - 1));
+  }
+}
+
+
+// ===============================
+// 14. 버퍼 함수
+// ===============================
+void addMedianBuffer(float ibi) {
+  medianBuf[medianIndex] = ibi;
+  medianIndex = (medianIndex + 1) % MEDIAN_BUF_SIZE;
+
+  if (medianCount < MEDIAN_BUF_SIZE) {
+    medianCount++;
+  }
+}
+
+
+void addIbiBuffer(float ibi) {
+  ibiBuf[ibiIndex] = ibi;
+  ibiIndex = (ibiIndex + 1) % IBI_BUF_SIZE;
+
+  if (ibiCount < IBI_BUF_SIZE) {
+    ibiCount++;
+  }
+}
+
+
+void addSqiBuffer(float ibi, float amp) {
+  sqiIbiBuf[sqiIndex] = ibi;
+  sqiAmpBuf[sqiIndex] = abs(amp);
+
+  sqiIndex = (sqiIndex + 1) % SQI_BUF_SIZE;
+
+  if (sqiCount < SQI_BUF_SIZE) {
+    sqiCount++;
+  }
+}
+
+
+// ===============================
+// 15. IBI 이상치 검사
+// ===============================
+bool isBasicValidIbi(float ibi) {
+  if (isnan(ibi)) return false;
+
+  if (ibi < MIN_IBI_MS || ibi > MAX_IBI_MS) {
+    return false;
+  }
+
+  if (medianCount >= 3) {
+    float med = calcMedian(medianBuf, medianCount);
+    float lower = med * (1.0 - LOCAL_MEDIAN_TOLERANCE);
+    float upper = med * (1.0 + LOCAL_MEDIAN_TOLERANCE);
+
+    if (ibi < lower || ibi > upper) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+
+bool isBaselineRangeValidIbi(float ibi) {
+  if (
+    baselineIbiCount >= 10 &&
+    !isnan(baselineIbiMean) &&
+    !isnan(baselineIbiStd) &&
+    baselineIbiStd > 0
+  ) {
+    float baselineLower = baselineIbiMean - BASELINE_IBI_STD_MULT * baselineIbiStd;
+    float baselineUpper = baselineIbiMean + BASELINE_IBI_STD_MULT * baselineIbiStd;
+
+    if (baselineLower < MIN_IBI_MS) baselineLower = MIN_IBI_MS;
+    if (baselineUpper > MAX_IBI_MS) baselineUpper = MAX_IBI_MS;
+
+    if (ibi < baselineLower || ibi > baselineUpper) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+
+// ===============================
+// 16. SQI 계산
+// ===============================
+float calculateSQI() {
+  if (sqiCount < SQI_MIN_COUNT) {
+    validWindowFlag = 0;
+    return NAN;
+  }
+
+  float tempIbi[SQI_BUF_SIZE];
+  float tempAmp[SQI_BUF_SIZE];
+
+  for (int i = 0; i < sqiCount; i++) {
+    int idx = (sqiIndex - sqiCount + i + SQI_BUF_SIZE) % SQI_BUF_SIZE;
+    tempIbi[i] = sqiIbiBuf[idx];
+    tempAmp[i] = sqiAmpBuf[idx];
+  }
+
+  float ibiCV = calcCV(tempIbi, sqiCount);
+  float ampCV = calcCV(tempAmp, sqiCount);
+
+  if (isnan(ibiCV) || isnan(ampCV)) {
+    validWindowFlag = 0;
+    return NAN;
+  }
+
+  float ibiScore = 100.0 * (1.0 - (ibiCV / MAX_IBI_CV));
+  ibiScore = constrain(ibiScore, 0.0, 100.0);
+
+  float ampScore = 100.0 * (1.0 - (ampCV / MAX_AMP_CV));
+  ampScore = constrain(ampScore, 0.0, 100.0);
+
+  float sqiScore = 0.6 * ibiScore + 0.4 * ampScore;
+
+  validWindowFlag = (sqiScore >= MIN_SQI_SCORE) ? 1 : 0;
+
+  return sqiScore;
+}
+
+
+// ===============================
+// 17. HRV 지표 계산
+// ===============================
+void updateHrvMetrics() {
+  if (ibiCount < 5) {
+    meanHR = NAN;
+    sdnn = NAN;
+    rmssd = NAN;
+    return;
+  }
+
+  float temp[IBI_BUF_SIZE];
+
+  for (int i = 0; i < ibiCount; i++) {
+    int idx = (ibiIndex - ibiCount + i + IBI_BUF_SIZE) % IBI_BUF_SIZE;
+    temp[i] = ibiBuf[idx];
+  }
+
+  float meanIbi = calcMean(temp, ibiCount);
+  meanHR = 60000.0 / meanIbi;
+
+  sdnn = calcStd(temp, ibiCount);
+
+  if (ibiCount < 2) {
+    rmssd = NAN;
+    return;
+  }
+
+  float sumDiffSq = 0;
+  int diffCount = 0;
+
+  for (int i = 1; i < ibiCount; i++) {
+    float diff = temp[i] - temp[i - 1];
+    sumDiffSq += diff * diff;
+    diffCount++;
+  }
+
+  if (diffCount > 0) {
+    rmssd = sqrt(sumDiffSq / diffCount);
+  } else {
+    rmssd = NAN;
+  }
+}
+
+
+// ===============================
+// 18. PPG z-score 및 최종 스트레스 점수 계산
+// ===============================
+String classifyStressLevel(float score) {
+  if (isnan(score)) {
+    return "";
+  }
+
+  if (score >= STRESS_THRESHOLD) {
+    return "Stress";
+  } else if (score >= NORMAL_THRESHOLD) {
+    return "Mild";
+  } else {
+    return "Normal";
+  }
+}
+
+
+void resetPpgStressScore() {
+  meanHrZ = NAN;
+  sdnnZ = NAN;
+  rmssdZ = NAN;
+
+  meanHrStressScore = NAN;
+  sdnnStressScore = NAN;
+  rmssdStressScore = NAN;
+
+  ppgAvgScore = NAN;
+  hrvScore = NAN;
+  finalPpgStressScore = NAN;
+  finalPpgStressLevel = "";
+}
+
+
+void updatePpgStressScore(String mode) {
+  // MONITORING 구간에서만 z-score 기반 최종 점수 계산
+  if (mode != "MONITORING") {
+    resetPpgStressScore();
+    return;
+  }
+
+  // baseline이 충분하지 않으면 계산 보류
+  if (
+    baselineMetricCount < MIN_BASELINE_METRIC_COUNT_FOR_Z ||
+    isnan(meanHR) ||
+    isnan(sdnn) ||
+    isnan(rmssd) ||
+    isnan(baselineMeanHRMean) ||
+    isnan(baselineMeanHRStd) ||
+    isnan(baselineSDNNMean) ||
+    isnan(baselineSDNNStd) ||
+    isnan(baselineRMSSDMean) ||
+    isnan(baselineRMSSDStd) ||
+    baselineMeanHRStd <= 0 ||
+    baselineSDNNStd <= 0 ||
+    baselineRMSSDStd <= 0
+  ) {
+    resetPpgStressScore();
+    return;
+  }
+
+  // z-score 계산
+  // Mean HR: 증가 방향이 스트레스
+  meanHrZ = (meanHR - baselineMeanHRMean) / baselineMeanHRStd;
+
+  // SDNN, RMSSD: 감소 방향이 스트레스
+  sdnnZ = (sdnn - baselineSDNNMean) / baselineSDNNStd;
+  rmssdZ = (rmssd - baselineRMSSDMean) / baselineRMSSDStd;
+
+  // 0~100 스트레스 점수 변환
+  meanHrStressScore = clampFloat((meanHrZ / MAX_Z_FOR_SCORE) * 100.0, 0.0, 100.0);
+  sdnnStressScore = clampFloat((-sdnnZ / MAX_Z_FOR_SCORE) * 100.0, 0.0, 100.0);
+  rmssdStressScore = clampFloat((-rmssdZ / MAX_Z_FOR_SCORE) * 100.0, 0.0, 100.0);
+
+  // 기본 평균 점수
+  ppgAvgScore = (meanHrStressScore + sdnnStressScore + rmssdStressScore) / 3.0;
+
+  // HRV 중심 점수
+  hrvScore = (sdnnStressScore + rmssdStressScore) / 2.0;
+
+  bool rmssdStress = rmssdStressScore >= STRESS_THRESHOLD;
+  bool sdnnStress = sdnnStressScore >= STRESS_THRESHOLD;
+
+  bool rmssdMild = rmssdStressScore >= NORMAL_THRESHOLD;
+  bool sdnnMild = sdnnStressScore >= NORMAL_THRESHOLD;
+
+  // 최종 PPG 점수 결정
+  if (rmssdStress && sdnnStress) {
+    finalPpgStressScore = max(ppgAvgScore, hrvScore);
+    finalPpgStressLevel = "Stress";
+  } else if (rmssdMild && sdnnMild) {
+    finalPpgStressScore = max(ppgAvgScore, hrvScore);
+    finalPpgStressLevel = classifyStressLevel(finalPpgStressScore);
+  } else {
+    finalPpgStressScore = ppgAvgScore;
+    finalPpgStressLevel = classifyStressLevel(finalPpgStressScore);
+  }
+}
+
+
+// ===============================
+// 19. mode 반환
+// ===============================
+String getMode(unsigned long elapsedMs, bool noFinger) {
+  if (noFinger) {
+    return "NO_FINGER";
+  }
+
+  if (elapsedMs < STABILIZING_TIME_MS) {
+    return "STABILIZING";
+  }
+
+  if (elapsedMs < STABILIZING_TIME_MS + CALIBRATION_TIME_MS) {
+    return "CALIBRATION";
+  }
+
+  return "MONITORING";
+}
+
+
+
+
+// ===============================
+// 20. 통합 CSV 출력 함수
+// ===============================
+void printCombinedCsvRow(unsigned long elapsedMs, String mode, long irRaw, float filteredPpg) {
+  float integratedStressScore = NAN;
+  String integratedStressLevel = "";
+
+  bool ppgReady = !isnan(finalPpgStressScore);
+  bool gsrReady = !isnan(gsr::latestFinalGsrStressScore);
+
+  if (ppgReady && gsrReady) {
+    integratedStressScore = (finalPpgStressScore + gsr::latestFinalGsrStressScore) / 2.0;
+    integratedStressLevel = classifyStressLevel(integratedStressScore);
+  }
+
+  Serial.print(elapsedMs);
+  Serial.print(",");
+
+  Serial.print(mode);
+  Serial.print(",");
+
+  Serial.print(irRaw);
+  Serial.print(",");
+
+  printFloatOrEmpty(filteredPpg, 4);
+  Serial.print(",");
+
+  printFloatOrEmpty(rawIbiMs, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(validIbiMs, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(meanHR, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(sdnn, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(rmssd, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(baselineMeanHRMean, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(baselineMeanHRStd, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(baselineSDNNMean, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(baselineSDNNStd, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(baselineRMSSDMean, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(baselineRMSSDStd, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(baselineIbiMean, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(baselineIbiStd, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(currentSQI, 2);
+  Serial.print(",");
+
+  Serial.print(validWindowFlag);
+  Serial.print(",");
+
+  printFloatOrEmpty(meanHrZ, 4);
+  Serial.print(",");
+
+  printFloatOrEmpty(sdnnZ, 4);
+  Serial.print(",");
+
+  printFloatOrEmpty(rmssdZ, 4);
+  Serial.print(",");
+
+  printFloatOrEmpty(meanHrStressScore, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(sdnnStressScore, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(rmssdStressScore, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(ppgAvgScore, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(hrvScore, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(finalPpgStressScore, 2);
+  Serial.print(",");
+
+  Serial.print(finalPpgStressLevel);
+  Serial.print(",");
+
+  Serial.print(ibiCount);
+  Serial.print(",");
+
+  Serial.print(baselineMetricCount);
+  Serial.print(",");
+
+  Serial.print(noFingerCount);
+  Serial.print(",");
+
+  Serial.print(gsr::latestMode);
+  Serial.print(",");
+
+  Serial.print(gsr::latestSampleIndex);
+  Serial.print(",");
+
+  Serial.print(gsr::latestRawGsr);
+  Serial.print(",");
+
+  printFloatOrEmpty(gsr::latestMedianGsr, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(gsr::latestSclBaseline, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(gsr::latestScrDetectBaseline, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(gsr::latestPhasic, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(gsr::latestPhasicPos, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(gsr::latestSclMean30s, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(gsr::latestScrAmplitudeMean30s, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(gsr::latestNsScrFrequencyPerMin, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(gsr::latestSclMeanZ, 4);
+  Serial.print(",");
+
+  printFloatOrEmpty(gsr::latestScrAmplitudeMeanZ, 4);
+  Serial.print(",");
+
+  printFloatOrEmpty(gsr::latestNsScrFrequencyZ, 4);
+  Serial.print(",");
+
+  printFloatOrEmpty(gsr::latestSclStressScore, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(gsr::latestScrAmplitudeStressScore, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(gsr::latestNsScrFrequencyStressScore, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(gsr::latestFinalGsrStressScore, 2);
+  Serial.print(",");
+
+  Serial.print(gsr::latestFeatureReady);
+  Serial.print(",");
+
+  Serial.print(gsr::latestContactOk);
+  Serial.print(",");
+
+  Serial.print(gsr::latestValidSampleFlag);
+  Serial.print(",");
+
+  printFloatOrEmpty(integratedStressScore, 2);
+  Serial.print(",");
+
+  Serial.println(integratedStressLevel);
+}
+
+// ===============================
+// 21. setup
+// ===============================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Wire.begin();
+
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("ERROR,MAX30102_NOT_FOUND");
+    while (1);
+  }
+
+  byte ledBrightness = 0x1F;
+  byte sampleAverage = 4;
+  byte ledMode = 2;
+  int sampleRate = 100;
+  int pulseWidth = 411;
+  int adcRange = 16384;
+
+  particleSensor.setup(
+    ledBrightness,
+    sampleAverage,
+    ledMode,
+    sampleRate,
+    pulseWidth,
+    adcRange
+  );
+
+  particleSensor.setPulseAmplitudeRed(0x1F);
+  particleSensor.setPulseAmplitudeIR(0x1F);
+
+  startTime = millis();
+  lastSampleTime = millis();
+  lastPrintTime = millis();
+
+  gsr::setup();
+
+  Serial.println(
+    "time_ms,ppg_mode,ir_raw,filtered_ppg,ibi_ms,valid_ibi_ms,"
+    "mean_hr,sdnn,rmssd,"
+    "baseline_mean_hr_mean,baseline_mean_hr_std,"
+    "baseline_sdnn_mean,baseline_sdnn_std,"
+    "baseline_rmssd_mean,baseline_rmssd_std,"
+    "baseline_ibi_mean,baseline_ibi_std,"
+    "sqi_score,valid_window_flag,"
+    "mean_hr_z,sdnn_z,rmssd_z,"
+    "mean_hr_stress_score,sdnn_stress_score,rmssd_stress_score,"
+    "ppg_avg_score,hrv_score,final_ppg_stress_score,final_ppg_stress_level,"
+    "ibi_count,baseline_count,no_finger_count,"
+    "gsr_mode,gsr_sample_index,raw_gsr,median_gsr,scl_baseline,scr_detect_baseline,"
+    "phasic,phasic_pos,scl_mean_30s,scr_amplitude_mean_30s,ns_scr_frequency_per_min,"
+    "scl_mean_z,scr_amplitude_mean_z,ns_scr_frequency_z,"
+    "scl_stress_score,scr_amplitude_stress_score,ns_scr_frequency_stress_score,"
+    "final_gsr_stress_score,gsr_feature_ready,gsr_contact_ok,gsr_valid_sample_flag,"
+    "integrated_stress_score,integrated_stress_level"
+  );
+}
+
+
+// ===============================
+// 21. loop
+// ===============================
+void loop() {
+  gsr::loop();
+
+  unsigned long now = millis();
+
+  if (now - lastSampleTime < SAMPLE_INTERVAL_MS) {
+    return;
+  }
+
+  lastSampleTime = now;
+
+  unsigned long elapsedMs = now - startTime;
+
+  long irRaw = particleSensor.getIR();
+
+  // 연속 미접촉 판정
+  if (irRaw <= 0 || irRaw < NO_FINGER_IR_THRESHOLD) {
+    consecutiveNoFinger++;
+  } else {
+    consecutiveNoFinger = 0;
+  }
+
+  bool noFinger = consecutiveNoFinger >= NO_FINGER_CONFIRM_COUNT;
+
+  if (noFinger) {
+    noFingerCount++;
+  }
+
+  String mode = getMode(elapsedMs, noFinger);
+
+  float filteredPpg = NAN;
+
+  // 손가락이 있다고 판단되는 경우에만 필터, peak, IBI 처리
+  if (!noFinger && irRaw > 0) {
+    filteredPpg = applyBandpass((float)irRaw);
+
+    if (mode != "STABILIZING") {
+      ppg_prev2 = ppg_prev1;
+      ppg_prev1 = ppg_curr;
+      ppg_curr = filteredPpg;
+
+      abs_ema = (1.0 - ABS_EMA_ALPHA) * abs_ema + ABS_EMA_ALPHA * abs(filteredPpg);
+      float peakThreshold = abs_ema * PEAK_THRESHOLD_RATIO;
+
+      bool isPeak = false;
+
+      if (
+        ppg_prev1 > ppg_prev2 &&
+        ppg_prev1 > ppg_curr &&
+        ppg_prev1 > peakThreshold &&
+        now - lastPeakTime > REFRACTORY_MS
+      ) {
+        isPeak = true;
+      }
+
+      if (isPeak) {
+        if (lastPeakTime > 0) {
+          rawIbiMs = (float)(now - lastPeakTime);
+          float peakAmp = ppg_prev1;
+
+          // 1. basic IBI 검사
+          if (isBasicValidIbi(rawIbiMs)) {
+
+            // 2. local median은 basic 통과 후 업데이트
+            addMedianBuffer(rawIbiMs);
+
+            // 3. CALIBRATION 구간 baseline IBI 누적
+            if (mode == "CALIBRATION") {
+              updateBaselineIbi(rawIbiMs);
+            }
+
+            // 4. baseline IBI 범위 검사
+            if (isBaselineRangeValidIbi(rawIbiMs)) {
+
+              // 5. SQI window 추가
+              addSqiBuffer(rawIbiMs, peakAmp);
+
+              // 6. SQI 계산
+              currentSQI = calculateSQI();
+
+              // 7. SQI 통과 시 최종 valid IBI 인정
+              if (validWindowFlag == 1) {
+                validIbiMs = rawIbiMs;
+
+                addIbiBuffer(validIbiMs);
+                updateHrvMetrics();
+
+                // CALIBRATION 구간에서는 최종 valid IBI 기반 HRV baseline 누적
+                if (mode == "CALIBRATION") {
+                  updateBaselineMetrics();
+                }
+              } else {
+                validIbiMs = NAN;
+              }
+
+            } else {
+              validIbiMs = NAN;
+            }
+
+          } else {
+            validIbiMs = NAN;
+          }
+        }
+
+        lastPeakTime = now;
+      }
+    }
+  } else {
+    filteredPpg = NAN;
+    validIbiMs = NAN;
+  }
+
+
+  // 1초마다 CSV 형식 출력
+  if (now - lastPrintTime >= PRINT_INTERVAL_MS) {
+    lastPrintTime = now;
+
+    // 출력 직전 현재 HRV와 baseline 기준으로 PPG 스트레스 점수 갱신
+    updatePpgStressScore(mode);
+
+    // PPG + GSR + 통합 스트레스 점수를 한 줄의 CSV로 출력
+    printCombinedCsvRow(elapsedMs, mode, irRaw, filteredPpg);
+
+    // 출력 후 다음 1초 구간의 새 IBI만 표시하기 위해 리셋
+    rawIbiMs = NAN;
+    validIbiMs = NAN;
+  }
+}
