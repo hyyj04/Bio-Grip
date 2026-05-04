@@ -8,7 +8,7 @@ namespace gsr {
   GSR Signal Processing for Arduino IDE
 
   Version:
-  Dual Baseline + Contact Check + Z-score + Stress Score
+  Dual Baseline + Contact Check + Z-score + Stress Score + Rise Check
 
   Pipeline:
   1. Data Acquisition: 10 Hz
@@ -17,8 +17,8 @@ namespace gsr {
   4. SCL baseline: Moving Average, N = 150
   5. SCR detection baseline: EMA
   6. Phasic = medianGSR - scrDetectBaseline
-  7. Baseline: 15~60 sec
-  8. Measurement: after 60 sec
+  7. Common timeline: 0~15 sec warm-up, 15~75 sec baseline
+  8. Measurement: after 75 sec
   9. 30 sec feature extraction
   10. Baseline-based z-score
   11. GSR stress score
@@ -57,7 +57,8 @@ const float SCR_BASELINE_ALPHA = 0.02;
 // Time section parameters
 // =====================
 const int USER_WARMUP_SEC = 15;
-const int BASELINE_END_SEC = 60;
+const int BASELINE_DURATION_SEC = 60;
+const int BASELINE_END_SEC = USER_WARMUP_SEC + BASELINE_DURATION_SEC;
 const int FEATURE_WINDOW_SEC = 30;
 
 const int MA_FILL_SAMPLES = MA_N;
@@ -72,8 +73,11 @@ const int FEATURE_WINDOW_SAMPLES = FEATURE_WINDOW_SEC * FS_GSR;
 // =====================
 // SCR detection parameters
 // =====================
-const float THRESHOLD_K = 2.0;
+const float THRESHOLD_K = 2.5;
 const float MIN_SCR_THRESHOLD_ADC = 6.0;
+// threshold를 넘는 작은 흔들림을 SCR로 오검출하지 않도록,
+// peak 후보가 직전 샘플 대비 최소한 이 정도 이상 상승했을 때만 SCR로 인정한다.
+const float MIN_SCR_RISE_ADC = 2.0;
 const float MAX_SCR_THRESHOLD_ADC = 15.0;
 const int REFRACTORY_SAMPLES = 10;
 
@@ -214,6 +218,16 @@ float latestScrAmplitudeStressScore = NAN;
 float latestNsScrFrequencyStressScore = NAN;
 float latestFinalGsrStressScore = NAN;
 int latestFeatureReady = 0;
+
+// GSR feature는 30초 window 단위로 갱신되므로, 최근 계산값을 일정 시간 동안만 유효하게 사용한다.
+// 이렇게 하면 새 window가 완성되기 전 출력 공백은 줄이고, 너무 오래된 값이 현재 상태처럼 통합되는 문제는 막을 수 있다.
+const unsigned long GSR_SCORE_FRESHNESS_MS = (FEATURE_WINDOW_SEC + 10UL) * 1000UL;
+unsigned long latestGsrScoreUpdateMs = 0;
+
+bool isLatestScoreFresh(unsigned long nowMs) {
+  if (latestGsrScoreUpdateMs == 0) return false;
+  return (nowMs - latestGsrScoreUpdateMs) <= GSR_SCORE_FRESHNESS_MS;
+}
 
 
 // =====================
@@ -546,6 +560,9 @@ void loop() {
     latestValidSampleFlag = 0;
     latestFeatureReady = 0;
 
+    // 접촉 불량 구간에서도 최근 GSR feature 값은 즉시 지우지 않는다.
+    // 통합 단계에서 contact_ok와 freshness time으로 사용 여부를 판단한다.
+
     if (PRINT_EVERY_SAMPLE) {
       printCsvRow(
         now,
@@ -613,7 +630,12 @@ void loop() {
   latestPhasic = phasic;
   latestPhasicPos = phasicPos;
   latestValidSampleFlag = validSampleFlag;
-  latestFeatureReady = 0;
+
+  // 새 30초 feature window가 완성되지 않은 샘플에서도, 최근 GSR 점수가 freshness time 안에 있으면 유효 feature로 표시한다.
+  latestFeatureReady = isLatestScoreFresh(now) ? 1 : 0;
+
+  // baseline/monitoring 전환 전에도 최근 feature 값을 강제로 지우지 않는다.
+  // latestGsrScoreUpdateMs가 0이면 freshness check에서 자동으로 제외된다.
 
   // Baseline statistics
   if (mode == 1 && validSampleFlag == 1) {
@@ -647,7 +669,12 @@ void loop() {
     bool refractoryOk =
       ((sampleIndex - 1) - lastScrSampleIndex) >= REFRACTORY_SAMPLES;
 
-    if (localPeak && aboveThreshold && refractoryOk) {
+    // local peak가 threshold를 넘더라도, 직전 샘플 대비 상승량이 너무 작으면
+    // 접촉 잡음/미세 흔들림일 가능성이 있어 SCR로 인정하지 않는다.
+    bool riseOk =
+      (phasicPrev1 - phasicPrev2) >= MIN_SCR_RISE_ADC;
+
+    if (localPeak && aboveThreshold && refractoryOk && riseOk) {
       scrFlag = 1;
 
       detectedScrSampleIndex = sampleIndex - 1;
@@ -714,10 +741,32 @@ void loop() {
       scrAmplitudeStressScore = zToStressScore(scrAmplitudeMeanZ);
       nsScrFrequencyStressScore = zToStressScore(nsScrFrequencyZ);
 
-      finalGsrStressScore =
-        (sclStressScore +
-         scrAmplitudeStressScore +
-         nsScrFrequencyStressScore) / 3.0;
+      // GSR 최종 점수는 임의 가중치를 두지 않고, 유효한 지표만 조건부 평균한다.
+      // SCL은 30초 평균이 항상 존재하므로 기본 지표로 사용한다.
+      // SCR amplitude와 NS-SCR frequency는 해당 window에서 SCR이 실제로 검출된 경우에만 평균에 포함한다.
+      float gsrScoreSum = 0.0;
+      int gsrScoreCount = 0;
+
+      if (!isnan(sclStressScore)) {
+        gsrScoreSum += sclStressScore;
+        gsrScoreCount++;
+      }
+
+      if (windowScrCount > 0 && !isnan(scrAmplitudeStressScore)) {
+        gsrScoreSum += scrAmplitudeStressScore;
+        gsrScoreCount++;
+      }
+
+      if (windowScrCount > 0 && !isnan(nsScrFrequencyStressScore)) {
+        gsrScoreSum += nsScrFrequencyStressScore;
+        gsrScoreCount++;
+      }
+
+      if (gsrScoreCount > 0) {
+        finalGsrStressScore = gsrScoreSum / gsrScoreCount;
+      } else {
+        finalGsrStressScore = NAN;
+      }
 
       latestSclMean30s = sclMean30s;
       latestScrAmplitudeMean30s = scrAmplitudeMean30s;
@@ -730,6 +779,7 @@ void loop() {
       latestNsScrFrequencyStressScore = nsScrFrequencyStressScore;
       latestFinalGsrStressScore = finalGsrStressScore;
       latestFeatureReady = 1;
+      latestGsrScoreUpdateMs = now;
 
       printCsvRow(
         now,
@@ -811,7 +861,7 @@ void loop() {
 const float FS = 100.0;
 const unsigned long SAMPLE_INTERVAL_MS = 10;
 
-const unsigned long STABILIZING_TIME_MS = 5000;
+const unsigned long STABILIZING_TIME_MS = 15000;
 const unsigned long CALIBRATION_TIME_MS = 60000;
 
 unsigned long startTime = 0;
@@ -945,7 +995,7 @@ int sqiIndex = 0;
 // 마우스 기반 PPG 환경을 고려해 완화한 SQI 기준
 const float MAX_IBI_CV = 0.45;
 const float MAX_AMP_CV = 1.20;
-const float MIN_SQI_SCORE = 45.0;
+const float MIN_SQI_SCORE = 50.0;
 
 float currentSQI = NAN;
 int validWindowFlag = 0;
@@ -973,7 +1023,12 @@ const float MAX_Z_FOR_SCORE = 3.0;
 const float NORMAL_THRESHOLD = 33.3;
 const float STRESS_THRESHOLD = 66.7;
 
-const int MIN_BASELINE_METRIC_COUNT_FOR_Z = 10;
+const int MIN_BASELINE_METRIC_COUNT_FOR_Z = 20;
+
+// baseline 표준편차가 너무 작을 때 z-score가 과하게 튀는 문제 방지
+const float MIN_MEAN_HR_STD_FOR_Z = 3.0;
+const float MIN_SDNN_STD_FOR_Z = 5.0;
+const float MIN_RMSSD_STD_FOR_Z = 5.0;
 
 
 // ===============================
@@ -1372,22 +1427,24 @@ void updatePpgStressScore(String mode) {
     isnan(baselineSDNNMean) ||
     isnan(baselineSDNNStd) ||
     isnan(baselineRMSSDMean) ||
-    isnan(baselineRMSSDStd) ||
-    baselineMeanHRStd <= 0 ||
-    baselineSDNNStd <= 0 ||
-    baselineRMSSDStd <= 0
+    isnan(baselineRMSSDStd)
   ) {
     resetPpgStressScore();
     return;
   }
 
   // z-score 계산
+  // baseline std가 너무 작으면 z-score가 폭주하므로 최소 표준편차를 적용
+  float safeMeanHrStd = max(baselineMeanHRStd, MIN_MEAN_HR_STD_FOR_Z);
+  float safeSdnnStd = max(baselineSDNNStd, MIN_SDNN_STD_FOR_Z);
+  float safeRmssdStd = max(baselineRMSSDStd, MIN_RMSSD_STD_FOR_Z);
+
   // Mean HR: 증가 방향이 스트레스
-  meanHrZ = (meanHR - baselineMeanHRMean) / baselineMeanHRStd;
+  meanHrZ = (meanHR - baselineMeanHRMean) / safeMeanHrStd;
 
   // SDNN, RMSSD: 감소 방향이 스트레스
-  sdnnZ = (sdnn - baselineSDNNMean) / baselineSDNNStd;
-  rmssdZ = (rmssd - baselineRMSSDMean) / baselineRMSSDStd;
+  sdnnZ = (sdnn - baselineSDNNMean) / safeSdnnStd;
+  rmssdZ = (rmssd - baselineRMSSDMean) / safeRmssdStd;
 
   // 0~100 스트레스 점수 변환
   meanHrStressScore = clampFloat((meanHrZ / MAX_Z_FOR_SCORE) * 100.0, 0.0, 100.0);
@@ -1449,11 +1506,37 @@ void printCombinedCsvRow(unsigned long elapsedMs, String mode, long irRaw, float
   float integratedStressScore = NAN;
   String integratedStressLevel = "";
 
-  bool ppgReady = !isnan(finalPpgStressScore);
-  bool gsrReady = !isnan(gsr::latestFinalGsrStressScore);
+  // 통합 점수는 strict AND 방식이 아니라 조건부 평균 방식으로 계산한다.
+  // PPG와 GSR이 모두 유효하면 두 값을 평균내고, 한쪽만 유효하면 해당 센서 값을 임시 통합값으로 사용한다.
+  bool ppgReady =
+    (mode == "MONITORING") &&
+    (validWindowFlag == 1) &&
+    !isnan(finalPpgStressScore);
 
-  if (ppgReady && gsrReady) {
-    integratedStressScore = (finalPpgStressScore + gsr::latestFinalGsrStressScore) / 2.0;
+  bool gsrFresh = gsr::isLatestScoreFresh(millis());
+
+  bool gsrReady =
+    (gsr::latestMode == 2) &&
+    (gsr::latestContactOk == 1) &&
+    (gsr::latestValidSampleFlag == 1) &&
+    gsrFresh &&
+    !isnan(gsr::latestFinalGsrStressScore);
+
+  float integratedScoreSum = 0.0;
+  int integratedScoreCount = 0;
+
+  if (ppgReady) {
+    integratedScoreSum += finalPpgStressScore;
+    integratedScoreCount++;
+  }
+
+  if (gsrReady) {
+    integratedScoreSum += gsr::latestFinalGsrStressScore;
+    integratedScoreCount++;
+  }
+
+  if (integratedScoreCount > 0) {
+    integratedStressScore = integratedScoreSum / integratedScoreCount;
     integratedStressLevel = classifyStressLevel(integratedStressScore);
   }
 
@@ -1577,6 +1660,15 @@ void printCombinedCsvRow(unsigned long elapsedMs, String mode, long irRaw, float
   printFloatOrEmpty(gsr::latestPhasicPos, 2);
   Serial.print(",");
 
+  printFloatOrEmpty(gsr::scrThreshold, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(gsr::MIN_SCR_THRESHOLD_ADC, 2);
+  Serial.print(",");
+
+  printFloatOrEmpty(gsr::MIN_SCR_RISE_ADC, 2);
+  Serial.print(",");
+
   printFloatOrEmpty(gsr::latestSclMean30s, 2);
   Serial.print(",");
 
@@ -1636,7 +1728,7 @@ void setup() {
     while (1);
   }
 
-  byte ledBrightness = 0x1F;
+  byte ledBrightness = 0x5F;
   byte sampleAverage = 4;
   byte ledMode = 2;
   int sampleRate = 100;
@@ -1655,11 +1747,21 @@ void setup() {
   particleSensor.setPulseAmplitudeRed(0x1F);
   particleSensor.setPulseAmplitudeIR(0x1F);
 
-  startTime = millis();
-  lastSampleTime = millis();
-  lastPrintTime = millis();
-
   gsr::setup();
+
+  // 파이썬에서 'S'를 받기 전까지 대기
+  // 파이썬이 포트를 열면 "READY"를 출력하고, 사용자가 Enter를 누르면 'S'가 전송된다.
+  Serial.println("READY");
+  while (true) {
+    if (Serial.available() && Serial.read() == 'S') break;
+  }
+
+  // 'S' 수신 시점부터 타이머 시작
+  unsigned long t0 = millis();
+  startTime        = t0;
+  lastSampleTime   = t0;
+  lastPrintTime    = t0;
+  gsr::lastSampleTime = t0;
 
   Serial.println(
     "time_ms,ppg_mode,ir_raw,filtered_ppg,ibi_ms,valid_ibi_ms,"
@@ -1674,7 +1776,7 @@ void setup() {
     "ppg_avg_score,hrv_score,final_ppg_stress_score,final_ppg_stress_level,"
     "ibi_count,baseline_count,no_finger_count,"
     "gsr_mode,gsr_sample_index,raw_gsr,median_gsr,scl_baseline,scr_detect_baseline,"
-    "phasic,phasic_pos,scl_mean_30s,scr_amplitude_mean_30s,ns_scr_frequency_per_min,"
+    "phasic,phasic_pos,gsr_scr_threshold,gsr_min_scr_threshold_adc,gsr_min_scr_rise_adc,scl_mean_30s,scr_amplitude_mean_30s,ns_scr_frequency_per_min,"
     "scl_mean_z,scr_amplitude_mean_z,ns_scr_frequency_z,"
     "scl_stress_score,scr_amplitude_stress_score,ns_scr_frequency_stress_score,"
     "final_gsr_stress_score,gsr_feature_ready,gsr_contact_ok,gsr_valid_sample_flag,"
@@ -1730,20 +1832,25 @@ void loop() {
       abs_ema = (1.0 - ABS_EMA_ALPHA) * abs_ema + ABS_EMA_ALPHA * abs(filteredPpg);
       float peakThreshold = abs_ema * PEAK_THRESHOLD_RATIO;
 
+      // local peak는 ppg_prev1, 즉 한 샘플 전 지점에서 발생한 것으로 판단한다.
+      // 따라서 IBI 계산과 refractory 판단에도 현재 now가 아니라 한 샘플 전 시간을 사용한다.
+      unsigned long peakTimeMs =
+        (now >= SAMPLE_INTERVAL_MS) ? (now - SAMPLE_INTERVAL_MS) : now;
+
       bool isPeak = false;
 
       if (
         ppg_prev1 > ppg_prev2 &&
         ppg_prev1 > ppg_curr &&
         ppg_prev1 > peakThreshold &&
-        now - lastPeakTime > REFRACTORY_MS
+        peakTimeMs - lastPeakTime > REFRACTORY_MS
       ) {
         isPeak = true;
       }
 
       if (isPeak) {
         if (lastPeakTime > 0) {
-          rawIbiMs = (float)(now - lastPeakTime);
+          rawIbiMs = (float)(peakTimeMs - lastPeakTime);
           float peakAmp = ppg_prev1;
 
           // 1. basic IBI 검사
@@ -1790,7 +1897,7 @@ void loop() {
           }
         }
 
-        lastPeakTime = now;
+        lastPeakTime = peakTimeMs;
       }
     }
   } else {
