@@ -67,7 +67,10 @@ const int USER_WARMUP_SAMPLES = USER_WARMUP_SEC * FS_GSR;
 const int WARMUP_SAMPLES =
   (USER_WARMUP_SAMPLES > MA_FILL_SAMPLES) ? USER_WARMUP_SAMPLES : MA_FILL_SAMPLES;
 
-const int BASELINE_END_SAMPLES = BASELINE_END_SEC * FS_GSR;
+const int BASELINE_END_SAMPLES  = BASELINE_END_SEC * FS_GSR;           // 750 samples (75s)
+const int REST_END_SAMPLES       = BASELINE_END_SAMPLES + 300 * FS_GSR; // 3750 samples (375s)
+const int TRANSITION_END_SAMPLES = REST_END_SAMPLES + 30 * FS_GSR;     // 4050 samples (405s)
+const int STRESS_END_SAMPLES     = TRANSITION_END_SAMPLES + 270 * FS_GSR; // 6750 samples (675s)
 const int FEATURE_WINDOW_SAMPLES = FEATURE_WINDOW_SEC * FS_GSR;
 
 // =====================
@@ -197,7 +200,7 @@ int sampleIndex = 0;
 // =====================
 // Latest GSR values for integrated output
 // =====================
-int latestMode = 0;
+String latestMode = "STABILIZING";
 int latestRawGsr = 0;
 int latestSampleIndex = 0;
 int latestContactOk = 0;
@@ -434,7 +437,7 @@ void printHeader() {
 void printCsvRow(
   unsigned long timeMs,
   int sIndex,
-  int mode,
+  String mode,
   int rawGsr,
   float medianGsr,
   float sclBaseline,
@@ -470,7 +473,106 @@ void setup() {
   for (int i = 0; i < MA_N; i++) {
     maBuf[i] = 0.0;
   }
+}
 
+
+// =====================
+// Reset all GSR variables
+// =====================
+void resetAll() {
+  // Median filter
+  for (int i = 0; i < MEDIAN_N; i++) medBuf[i] = 0.0;
+  medIndex = 0;
+  medFilled = false;
+
+  // MA buffer
+  for (int i = 0; i < MA_N; i++) maBuf[i] = 0.0;
+  maIndex = 0;
+  maCount = 0;
+  maSum = 0.0;
+
+  // EMA baseline
+  scrDetectBaseline = 0.0;
+  scrBaselineInitialized = false;
+
+  // Last valid signal
+  lastMedianGsr = 0.0;
+  lastSclBaseline = 0.0;
+  lastScrDetectBaseline = 0.0;
+  hasValidSignal = false;
+
+  // Baseline statistics
+  baselinePhasicSum = 0.0;
+  baselinePhasicSqSum = 0.0;
+  baselineCount = 0;
+  baselinePhasicMean = 0.0;
+  baselinePhasicStd = 0.0;
+
+  baselineSclSum = 0.0;
+  baselineSclSqSum = 0.0;
+  baselineSclCount = 0;
+  baselineSclMean = 0.0;
+  baselineSclStd = 0.0;
+
+  baselinePhasicPosSum = 0.0;
+  baselinePhasicPosSqSum = 0.0;
+  baselinePhasicPosCount = 0;
+  baselinePhasicPosMean = 0.0;
+  baselinePhasicPosStd = 0.0;
+
+  baselineNsScrFreqMean = 0.0;
+  baselineNsScrFreqStd = MIN_FREQ_STD_FOR_Z;
+
+  // Threshold & ready flag
+  scrThreshold = MIN_SCR_THRESHOLD_ADC;
+  baselineReady = false;
+
+  // Feature window
+  windowSclSum = 0.0;
+  windowSampleCount = 0;
+  windowScrAmpSum = 0.0;
+  windowScrCount = 0;
+
+  // SCR peak detection
+  phasicPrev2 = 0.0;
+  phasicPrev1 = 0.0;
+  phasicCurr = 0.0;
+  lastScrSampleIndex = -9999;
+  detectedScrSampleIndex = -1;
+  detectedScrTimeMs = 0;
+
+  // Sample time
+  prev2SampleTimeMs = 0;
+  prev1SampleTimeMs = 0;
+  currSampleTimeMs = 0;
+
+  // General
+  sampleIndex = 0;
+  contactRecoveryCount = 0;
+
+  // Latest output values
+  latestMode = "STABILIZING";
+  latestRawGsr = 0;
+  latestSampleIndex = 0;
+  latestContactOk = 0;
+  latestValidSampleFlag = 0;
+  latestMedianGsr = NAN;
+  latestSclBaseline = NAN;
+  latestScrDetectBaseline = NAN;
+  latestPhasic = NAN;
+  latestPhasicPos = NAN;
+  latestSclMean30s = NAN;
+  latestScrAmplitudeMean30s = NAN;
+  latestNsScrFrequencyPerMin = NAN;
+  latestSclMeanZ = NAN;
+  latestScrAmplitudeMeanZ = NAN;
+  latestNsScrFrequencyZ = NAN;
+  latestSclStressScore = NAN;
+  latestScrAmplitudeStressScore = NAN;
+  latestNsScrFrequencyStressScore = NAN;
+  latestFinalGsrStressScore = NAN;
+  latestFeatureReady = 0;
+  latestGsrScoreUpdateMs = 0;
 }
 
 
@@ -490,14 +592,20 @@ void loop() {
   prev1SampleTimeMs = currSampleTimeMs;
   currSampleTimeMs = now;
 
-  int mode = 0;
+  String mode;
 
   if (sampleIndex < WARMUP_SAMPLES) {
-    mode = 0;
+    mode = "STABILIZING";
   } else if (sampleIndex < BASELINE_END_SAMPLES) {
-    mode = 1;
+    mode = "CALIBRATION";
+  } else if (sampleIndex < REST_END_SAMPLES) {
+    mode = "REST";
+  } else if (sampleIndex < TRANSITION_END_SAMPLES) {
+    mode = "TRANSITION";
+  } else if (sampleIndex < STRESS_END_SAMPLES) {
+    mode = "STRESS";
   } else {
-    mode = 2;
+    mode = "DONE";
   }
 
   int rawGsr = analogRead(GSR_PIN);
@@ -638,7 +746,7 @@ void loop() {
   // latestGsrScoreUpdateMs가 0이면 freshness check에서 자동으로 제외된다.
 
   // Baseline statistics
-  if (mode == 1 && validSampleFlag == 1) {
+  if (mode == "CALIBRATION" && validSampleFlag == 1) {
     baselinePhasicSum += phasic;
     baselinePhasicSqSum += phasic * phasic;
     baselineCount++;
@@ -653,7 +761,7 @@ void loop() {
   }
 
   // SCR peak detection
-  if (mode == 2 && baselineReady && validSampleFlag == 1) {
+  if ((mode == "REST" || mode == "STRESS") && baselineReady && validSampleFlag == 1) {
     phasicPrev2 = phasicPrev1;
     phasicPrev1 = phasicCurr;
     phasicCurr = phasicPos;
@@ -692,7 +800,7 @@ void loop() {
   }
 
   // Feature window
-  if (mode == 2 && baselineReady && validSampleFlag == 1) {
+  if ((mode == "REST" || mode == "STRESS") && baselineReady && validSampleFlag == 1) {
     windowSclSum += sclBaseline;
     windowSampleCount++;
 
@@ -861,12 +969,19 @@ void loop() {
 const float FS = 100.0;
 const unsigned long SAMPLE_INTERVAL_MS = 10;
 
-const unsigned long STABILIZING_TIME_MS = 15000;
-const unsigned long CALIBRATION_TIME_MS = 60000;
+const unsigned long STABILIZING_TIME_MS  = 15000;
+const unsigned long CALIBRATION_TIME_MS  = 60000;
+const unsigned long REST_TIME_MS         = 300000;  // 5분 안정 구간, label 0
+const unsigned long TRANSITION_TIME_MS   = 30000;   // 스트레스 과제 시작 후 30초, 라벨링 제외
+const unsigned long STRESS_TIME_MS       = 270000;  // 스트레스 후반 4분 30초, label 1
+// 총 측정 시간: 15 + 60 + 300 + 30 + 270 = 675초 (11분 15초)
 
 unsigned long startTime = 0;
 unsigned long lastSampleTime = 0;
 unsigned long lastPrintTime = 0;
+
+// DONE 상태에서 완료 메시지를 한 번만 출력하고, R 명령으로 재시작할 수 있게 하는 플래그
+bool measurementDonePrinted = false;
 
 const unsigned long PRINT_INTERVAL_MS = 1000;
 
@@ -1410,8 +1525,9 @@ void resetPpgStressScore() {
 
 
 void updatePpgStressScore(String mode) {
-  // MONITORING 구간에서만 z-score 기반 최종 점수 계산
-  if (mode != "MONITORING") {
+  // REST / STRESS 구간에서만 z-score 기반 최종 점수 계산
+  // TRANSITION은 과제 시작 직후 30초 과도기이므로 라벨링/분석에서 제외
+  if (mode != "REST" && mode != "STRESS") {
     resetPpgStressScore();
     return;
   }
@@ -1485,15 +1601,48 @@ String getMode(unsigned long elapsedMs, bool noFinger) {
     return "NO_FINGER";
   }
 
-  if (elapsedMs < STABILIZING_TIME_MS) {
+  unsigned long t1 = STABILIZING_TIME_MS;
+  unsigned long t2 = t1 + CALIBRATION_TIME_MS;
+  unsigned long t3 = t2 + REST_TIME_MS;
+  unsigned long t4 = t3 + TRANSITION_TIME_MS;
+  unsigned long t5 = t4 + STRESS_TIME_MS;
+
+  if (elapsedMs < t1) {
     return "STABILIZING";
   }
 
-  if (elapsedMs < STABILIZING_TIME_MS + CALIBRATION_TIME_MS) {
+  if (elapsedMs < t2) {
     return "CALIBRATION";
   }
 
-  return "MONITORING";
+  if (elapsedMs < t3) {
+    return "REST";
+  }
+
+  if (elapsedMs < t4) {
+    return "TRANSITION";
+  }
+
+  if (elapsedMs < t5) {
+    return "STRESS";
+  }
+
+  return "DONE";
+}
+
+// 성능 평가용 라벨링
+// -1: 라벨링 제외(STABILIZING, CALIBRATION, TRANSITION, DONE, NO_FINGER)
+//  0: 안정 상태 REST
+//  1: 스트레스 상태 STRESS
+int getClassLabel(String mode) {
+  if (mode == "REST") return 0;
+  if (mode == "STRESS") return 1;
+  return -1;
+}
+
+int getLabelValid(String mode) {
+  int label = getClassLabel(mode);
+  return (label == 0 || label == 1) ? 1 : 0;
 }
 
 
@@ -1509,14 +1658,14 @@ void printCombinedCsvRow(unsigned long elapsedMs, String mode, long irRaw, float
   // 통합 점수는 strict AND 방식이 아니라 조건부 평균 방식으로 계산한다.
   // PPG와 GSR이 모두 유효하면 두 값을 평균내고, 한쪽만 유효하면 해당 센서 값을 임시 통합값으로 사용한다.
   bool ppgReady =
-    (mode == "MONITORING") &&
+    (mode == "REST" || mode == "STRESS") &&
     (validWindowFlag == 1) &&
     !isnan(finalPpgStressScore);
 
   bool gsrFresh = gsr::isLatestScoreFresh(millis());
 
   bool gsrReady =
-    (gsr::latestMode == 2) &&
+    (gsr::latestMode == "REST" || gsr::latestMode == "STRESS") &&
     (gsr::latestContactOk == 1) &&
     (gsr::latestValidSampleFlag == 1) &&
     gsrFresh &&
@@ -1547,6 +1696,12 @@ void printCombinedCsvRow(unsigned long elapsedMs, String mode, long irRaw, float
   Serial.print(",");
 
   Serial.print(irRaw);
+  Serial.print(",");
+
+  Serial.print(getClassLabel(mode));
+  Serial.print(",");
+
+  Serial.print(getLabelValid(mode));
   Serial.print(",");
 
   printFloatOrEmpty(filteredPpg, 4);
@@ -1715,7 +1870,100 @@ void printCombinedCsvRow(unsigned long elapsedMs, String mode, long irRaw, float
 }
 
 // ===============================
-// 21. setup
+// 21. PPG 전체 변수 초기화 함수
+// ===============================
+void resetPpgVariables() {
+  // 필터 상태
+  hp_x1 = 0; hp_x2 = 0; hp_y1 = 0; hp_y2 = 0;
+  lp_x1 = 0; lp_x2 = 0; lp_y1 = 0; lp_y2 = 0;
+
+  // Peak 검출
+  ppg_prev2 = 0; ppg_prev1 = 0; ppg_curr = 0;
+  abs_ema = 0;
+  lastPeakTime = 0;
+  rawIbiMs = NAN;
+  validIbiMs = NAN;
+
+  // Median buffer
+  for (int i = 0; i < MEDIAN_BUF_SIZE; i++) medianBuf[i] = 0;
+  medianCount = 0;
+  medianIndex = 0;
+
+  // IBI buffer
+  for (int i = 0; i < IBI_BUF_SIZE; i++) ibiBuf[i] = 0;
+  ibiCount = 0;
+  ibiIndex = 0;
+  meanHR = NAN; sdnn = NAN; rmssd = NAN;
+
+  // Baseline HRV
+  baselineMetricCount = 0;
+  baselineMeanHRMean = NAN; baselineMeanHRStd = NAN;
+  baselineSDNNMean = NAN;   baselineSDNNStd = NAN;
+  baselineRMSSDMean = NAN;  baselineRMSSDStd = NAN;
+  meanHR_m = 0; meanHR_s = 0;
+  sdnn_m = 0;   sdnn_s = 0;
+  rmssd_m = 0;  rmssd_s = 0;
+
+  // Baseline IBI
+  baselineIbiCount = 0;
+  baselineIbiMean = NAN; baselineIbiStd = NAN;
+  baselineIbi_m = 0;     baselineIbi_s = 0;
+
+  // SQI
+  for (int i = 0; i < SQI_BUF_SIZE; i++) { sqiIbiBuf[i] = 0; sqiAmpBuf[i] = 0; }
+  sqiCount = 0; sqiIndex = 0;
+  currentSQI = NAN; validWindowFlag = 0;
+
+  // Z-score / stress score
+  meanHrZ = NAN; sdnnZ = NAN; rmssdZ = NAN;
+  meanHrStressScore = NAN; sdnnStressScore = NAN; rmssdStressScore = NAN;
+  ppgAvgScore = NAN; hrvScore = NAN; finalPpgStressScore = NAN;
+  finalPpgStressLevel = "";
+
+  // 접촉 카운터
+  consecutiveNoFinger = 0;
+  noFingerCount = 0;
+}
+
+
+// ===============================
+// 22. 전체 시스템 초기화 함수 (재측정 시작)
+// ===============================
+void startMeasurement() {
+  resetPpgVariables();
+  gsr::resetAll();
+
+  unsigned long t0 = millis();
+  startTime           = t0;
+  lastSampleTime      = t0;
+  lastPrintTime       = t0;
+  gsr::lastSampleTime = t0;
+  measurementDonePrinted = false;
+
+  Serial.println(
+    "time_ms,ppg_mode,ir_raw,class_label,label_valid,filtered_ppg,ibi_ms,valid_ibi_ms,"
+    "mean_hr,sdnn,rmssd,"
+    "baseline_mean_hr_mean,baseline_mean_hr_std,"
+    "baseline_sdnn_mean,baseline_sdnn_std,"
+    "baseline_rmssd_mean,baseline_rmssd_std,"
+    "baseline_ibi_mean,baseline_ibi_std,"
+    "sqi_score,valid_window_flag,"
+    "mean_hr_z,sdnn_z,rmssd_z,"
+    "mean_hr_stress_score,sdnn_stress_score,rmssd_stress_score,"
+    "ppg_avg_score,hrv_score,final_ppg_stress_score,final_ppg_stress_level,"
+    "ibi_count,baseline_count,no_finger_count,"
+    "gsr_mode,gsr_sample_index,raw_gsr,median_gsr,scl_baseline,scr_detect_baseline,"
+    "phasic,phasic_pos,gsr_scr_threshold,gsr_min_scr_threshold_adc,gsr_min_scr_rise_adc,scl_mean_30s,scr_amplitude_mean_30s,ns_scr_frequency_per_min,"
+    "scl_mean_z,scr_amplitude_mean_z,ns_scr_frequency_z,"
+    "scl_stress_score,scr_amplitude_stress_score,ns_scr_frequency_stress_score,"
+    "final_gsr_stress_score,gsr_feature_ready,gsr_contact_ok,gsr_valid_sample_flag,"
+    "integrated_stress_score,integrated_stress_level"
+  );
+}
+
+
+// ===============================
+// 23. setup
 // ===============================
 void setup() {
   Serial.begin(115200);
@@ -1744,8 +1992,8 @@ void setup() {
     adcRange
   );
 
-  particleSensor.setPulseAmplitudeRed(0x1F);
-  particleSensor.setPulseAmplitudeIR(0x1F);
+  particleSensor.setPulseAmplitudeRed(0x5F);
+  particleSensor.setPulseAmplitudeIR(0x5F);
 
   gsr::setup();
 
@@ -1756,39 +2004,26 @@ void setup() {
     if (Serial.available() && Serial.read() == 'S') break;
   }
 
-  // 'S' 수신 시점부터 타이머 시작
-  unsigned long t0 = millis();
-  startTime        = t0;
-  lastSampleTime   = t0;
-  lastPrintTime    = t0;
-  gsr::lastSampleTime = t0;
-
-  Serial.println(
-    "time_ms,ppg_mode,ir_raw,filtered_ppg,ibi_ms,valid_ibi_ms,"
-    "mean_hr,sdnn,rmssd,"
-    "baseline_mean_hr_mean,baseline_mean_hr_std,"
-    "baseline_sdnn_mean,baseline_sdnn_std,"
-    "baseline_rmssd_mean,baseline_rmssd_std,"
-    "baseline_ibi_mean,baseline_ibi_std,"
-    "sqi_score,valid_window_flag,"
-    "mean_hr_z,sdnn_z,rmssd_z,"
-    "mean_hr_stress_score,sdnn_stress_score,rmssd_stress_score,"
-    "ppg_avg_score,hrv_score,final_ppg_stress_score,final_ppg_stress_level,"
-    "ibi_count,baseline_count,no_finger_count,"
-    "gsr_mode,gsr_sample_index,raw_gsr,median_gsr,scl_baseline,scr_detect_baseline,"
-    "phasic,phasic_pos,gsr_scr_threshold,gsr_min_scr_threshold_adc,gsr_min_scr_rise_adc,scl_mean_30s,scr_amplitude_mean_30s,ns_scr_frequency_per_min,"
-    "scl_mean_z,scr_amplitude_mean_z,ns_scr_frequency_z,"
-    "scl_stress_score,scr_amplitude_stress_score,ns_scr_frequency_stress_score,"
-    "final_gsr_stress_score,gsr_feature_ready,gsr_contact_ok,gsr_valid_sample_flag,"
-    "integrated_stress_score,integrated_stress_level"
-  );
+  // 'S' 수신 시점부터 타이머 시작 → startMeasurement()로 위임
+  startMeasurement();
 }
 
 
 // ===============================
-// 21. loop
+// 24. loop
 // ===============================
 void loop() {
+  // 'R' 키 수신 시 전체 초기화 후 재측정 시작
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    if (cmd == 'R' || cmd == 'r') {
+      Serial.println("RESET");
+      delay(100);
+      startMeasurement();
+      return;
+    }
+  }
+
   gsr::loop();
 
   unsigned long now = millis();
@@ -1817,6 +2052,17 @@ void loop() {
   }
 
   String mode = getMode(elapsedMs, noFinger);
+
+  // 11분 15초 측정 완료
+  // 무한 대기로 막지 않고, 완료 메시지만 한 번 출력한 뒤 loop를 계속 돌린다.
+  // 그래야 DONE 이후에도 PC에서 R/r 명령을 보내 재측정을 시작할 수 있다.
+  if (mode == "DONE") {
+    if (!measurementDonePrinted) {
+      Serial.println("MEASUREMENT_DONE");
+      measurementDonePrinted = true;
+    }
+    return;
+  }
 
   float filteredPpg = NAN;
 
