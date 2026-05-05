@@ -3,7 +3,8 @@ BLE CSV Logger for BioGrip_Feature / Nano 33 BLE integrated PPG+GSR code
 
 This script connects to the Arduino BLE peripheral, writes commands to the
 Control Point characteristic, subscribes to Feature Data notifications, decodes
-19-byte binary packets, displays them, and saves them to CSV.
+21-byte binary packets with a uint16 sequence number, displays them, checks for missed packets,
+and saves them to CSV.
 
 Install:
   pip install bleak
@@ -18,6 +19,7 @@ Commands after connection:
 
 Expected MCU BLE packet layout, C struct:
   struct BleFeatureData {
+    uint16_t seq;                  // 2 bytes
     float mean_hr;                 // 4 bytes
     float final_ppg_stress_score;  // 4 bytes
     float final_gsr_stress_score;  // 4 bytes
@@ -25,7 +27,7 @@ Expected MCU BLE packet layout, C struct:
     uint8_t integrated_level;      // 1 byte
     uint8_t mode_code;             // 1 byte
     uint8_t flags;                 // 1 byte
-  }; // total 19 bytes, little-endian on Arduino Nano 33 BLE
+  }; // total 21 bytes, little-endian on Arduino Nano 33 BLE
 """
 
 import asyncio
@@ -65,8 +67,8 @@ FILE_PREFIX = "ppg_gsr_ble"
 PRINT_EVERY_N_PACKETS = 1
 
 # Arduino ARM boards generally send float as IEEE-754 little-endian.
-# 4 floats + 3 unsigned bytes = 19 bytes.
-PACKET_STRUCT = struct.Struct("<ffffBBB")
+# uint16 seq + 4 floats + 3 unsigned bytes = 21 bytes.
+PACKET_STRUCT = struct.Struct("<HffffBBB")
 
 MODE_NAMES = {
     0: "UNKNOWN",
@@ -81,14 +83,18 @@ MODE_NAMES = {
 
 LEVEL_NAMES = {
     0: "NONE",
-    1: "Normal",
-    2: "Mild",
-    3: "Stress",
+    1: "Relaxed",
+    2: "Normal",
+    3: "Mild",
+    4: "Stress",
 }
 
 CSV_HEADER = [
     "pc_time_iso",
     "elapsed_pc_s",
+    "seq",
+    "missing_since_prev",
+    "total_missing_packets",
     "mean_hr",
     "final_ppg_stress_score",
     "final_gsr_stress_score",
@@ -107,6 +113,7 @@ CSV_HEADER = [
 
 @dataclass
 class BleFeaturePacket:
+    seq: int
     mean_hr: float
     final_ppg_stress_score: float
     final_gsr_stress_score: float
@@ -153,23 +160,27 @@ def decode_packet(data: bytearray) -> BleFeaturePacket:
 
     values = PACKET_STRUCT.unpack(bytes(data))
     return BleFeaturePacket(
-        mean_hr=values[0],
-        final_ppg_stress_score=values[1],
-        final_gsr_stress_score=values[2],
-        integrated_stress_score=values[3],
-        integrated_level_code=values[4],
-        mode_code=values[5],
-        flags=values[6],
+        seq=values[0],
+        mean_hr=values[1],
+        final_ppg_stress_score=values[2],
+        final_gsr_stress_score=values[3],
+        integrated_stress_score=values[4],
+        integrated_level_code=values[5],
+        mode_code=values[6],
+        flags=values[7],
         raw_hex=bytes(data).hex(" "),
     )
 
 
-def packet_to_csv_row(packet: BleFeaturePacket, start_time: datetime) -> list:
+def packet_to_csv_row(packet: BleFeaturePacket, start_time: datetime, missing_since_prev: int, total_missing_packets: int) -> list:
     now = datetime.now()
     elapsed = (now - start_time).total_seconds()
     return [
         now.isoformat(timespec="milliseconds"),
         f"{elapsed:.3f}",
+        packet.seq,
+        missing_since_prev,
+        total_missing_packets,
         f"{packet.mean_hr:.3f}",
         f"{packet.final_ppg_stress_score:.3f}",
         f"{packet.final_gsr_stress_score:.3f}",
@@ -252,6 +263,8 @@ async def main() -> None:
     start_time = datetime.now()
     packet_count = 0
     bad_packet_count = 0
+    prev_seq: Optional[int] = None
+    total_missing_packets = 0
 
     device = await find_device()
 
@@ -268,7 +281,7 @@ async def main() -> None:
             f.flush()
 
             def notification_handler(sender, data: bytearray):
-                nonlocal packet_count, bad_packet_count
+                nonlocal packet_count, bad_packet_count, prev_seq, total_missing_packets
 
                 try:
                     packet = decode_packet(data)
@@ -277,8 +290,23 @@ async def main() -> None:
                     print(f"경고: BLE 패킷 해석 실패: {e}, raw={bytes(data).hex(' ')}")
                     return
 
+                missing_since_prev = 0
+                if prev_seq is not None:
+                    seq_delta = (packet.seq - prev_seq) & 0xFFFF
+                    if seq_delta == 0:
+                        print(f"경고: 중복 BLE seq 수신: seq={packet.seq}")
+                    elif seq_delta > 1:
+                        missing_since_prev = seq_delta - 1
+                        total_missing_packets += missing_since_prev
+                        print(
+                            f"경고: BLE 패킷 누락 감지: prev_seq={prev_seq}, "
+                            f"current_seq={packet.seq}, missing={missing_since_prev}, "
+                            f"total_missing={total_missing_packets}"
+                        )
+                prev_seq = packet.seq
+
                 packet_count += 1
-                row = packet_to_csv_row(packet, start_time)
+                row = packet_to_csv_row(packet, start_time, missing_since_prev, total_missing_packets)
                 writer.writerow(row)
 
                 if packet_count % 10 == 0:
@@ -287,6 +315,8 @@ async def main() -> None:
                 if PRINT_EVERY_N_PACKETS > 0 and packet_count % PRINT_EVERY_N_PACKETS == 0:
                     print(
                         f"[{packet_count:05d}] "
+                        f"seq={packet.seq:05d} "
+                        f"miss={total_missing_packets:03d} "
                         f"mode={packet.mode:<12} "
                         f"HR={packet.mean_hr:7.2f} "
                         f"PPG={packet.final_ppg_stress_score:6.3f} "
@@ -313,6 +343,7 @@ async def main() -> None:
         print("\nBLE 연결 종료")
         print(f"CSV 저장 완료: {output_path}")
         print(f"저장 패킷 수: {packet_count}")
+        print(f"누락 감지 패킷 수: {total_missing_packets}")
         print(f"해석 실패 패킷 수: {bad_packet_count}")
 
 
