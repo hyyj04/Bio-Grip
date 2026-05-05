@@ -2,30 +2,39 @@
 #include "MAX30105.h"
 #include <ArduinoBLE.h>
 
+// v7 BLE centered-50 final v7
+// - PPG/GSR 50-centered score scale 통일
+// - BLE sequence 번호 추가 및 notify/Serial CSV 타이머 분리
+// - BLE 측정 시 Serial CSV 출력을 옵션으로 비활성화 가능
+// - dead code/주석 정리
+// - BLE_NOTIFY_INTERVAL_MS = 500ms (CSV 1000ms와 독립 발화로 BLE 지연 감소)
+
 MAX30105 particleSensor;
 
 // ===============================
 // BLE 설정
 // ===============================
 BLEService bioDataService("19B10000-E8F2-537E-4F6C-D104768A1214");
-BLECharacteristic featureDataChar("19B10001-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify, 20);
+BLECharacteristic featureDataChar("19B10001-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify, 32);
 BLEUnsignedCharCharacteristic controlPointChar("19B10002-E8F2-537E-4F6C-D104768A1214", BLEWrite);
 
 // BLE로 전송할 최종 특징 데이터
-// 20 byte 제한을 맞추기 위해 핵심 결과만 바이너리 구조체로 전송한다.
+// seq를 포함해 패킷 유실 여부를 PC에서 즉시 확인할 수 있게 한다.
 #pragma pack(1)
 struct BleFeatureData {
+  uint16_t seq;                  // 2 byte, BLE notify sequence number
   float mean_hr;                 // 4 byte
   float final_ppg_stress_score;  // 4 byte
   float final_gsr_stress_score;  // 4 byte
   float integrated_stress_score; // 4 byte
-  uint8_t integrated_level;      // 0: none, 1: Normal, 2: Mild, 3: Stress
-  uint8_t mode_code;             // 0~6
+  uint8_t integrated_level;      // 0: none, 1: Relaxed, 2: Normal, 3: Mild, 4: Stress
+  uint8_t mode_code;             // 0~7, 7: NO_FINGER
   uint8_t flags;                 // bit0: ppgReady, bit1: gsrReady, bit2: labelValid, bit3: measuring
-}; // 총 19 byte
+}; // 총 21 byte
 #pragma pack()
 
 BleFeatureData latestBleFeatures;
+uint16_t bleSeq = 0;
 
 bool measurementActive = false;
 
@@ -35,6 +44,18 @@ bool latestPpgReadyForBle = false;
 bool latestGsrReadyForBle = false;
 
 void startMeasurement();
+
+// ===============================
+// 공통 측정 타임라인 설정
+// ===============================
+// PPG와 GSR이 같은 구간 길이를 참조하도록 공통 상수로 둔다.
+const unsigned long COMMON_STABILIZING_TIME_MS = 15000UL;
+const unsigned long COMMON_CALIBRATION_TIME_MS = 60000UL;
+const unsigned long COMMON_REST_TIME_MS = 300000UL;
+const unsigned long COMMON_TRANSITION_TIME_MS = 30000UL;
+const unsigned long COMMON_STRESS_TIME_MS = 270000UL;
+const unsigned long COMMON_BASELINE_END_MS = COMMON_STABILIZING_TIME_MS + COMMON_CALIBRATION_TIME_MS;
+const unsigned long COMMON_FEATURE_WINDOW_MS = 30000UL;
 
 
 namespace gsr {
@@ -90,21 +111,9 @@ const float SCR_BASELINE_ALPHA = 0.02;
 // =====================
 // Time section parameters
 // =====================
-const int USER_WARMUP_SEC = 15;
-const int BASELINE_DURATION_SEC = 60;
-const int BASELINE_END_SEC = USER_WARMUP_SEC + BASELINE_DURATION_SEC;
-const int FEATURE_WINDOW_SEC = 30;
+const int USER_WARMUP_SEC = COMMON_STABILIZING_TIME_MS / 1000UL;
+const int FEATURE_WINDOW_SEC = COMMON_FEATURE_WINDOW_MS / 1000UL;
 
-const int MA_FILL_SAMPLES = MA_N;
-const int USER_WARMUP_SAMPLES = USER_WARMUP_SEC * FS_GSR;
-
-const int WARMUP_SAMPLES =
-  (USER_WARMUP_SAMPLES > MA_FILL_SAMPLES) ? USER_WARMUP_SAMPLES : MA_FILL_SAMPLES;
-
-const int BASELINE_END_SAMPLES  = BASELINE_END_SEC * FS_GSR;           // 750 samples (75s)
-const int REST_END_SAMPLES       = BASELINE_END_SAMPLES + 300 * FS_GSR; // 3750 samples (375s)
-const int TRANSITION_END_SAMPLES = REST_END_SAMPLES + 30 * FS_GSR;     // 4050 samples (405s)
-const int STRESS_END_SAMPLES     = TRANSITION_END_SAMPLES + 270 * FS_GSR; // 6750 samples (675s)
 const int FEATURE_WINDOW_SAMPLES = FEATURE_WINDOW_SEC * FS_GSR;
 
 // =====================
@@ -126,9 +135,15 @@ const float MIN_SCL_STD_FOR_Z = 1.0;
 const float MIN_PHASIC_STD_FOR_Z = 1.0;
 const float MIN_FREQ_STD_FOR_Z = 2.0;
 
+// GSR baseline 유효성 검증 기준
+// 60초 calibration × 10 Hz = 최대 600 samples 중 최소 300 samples(50%) 이상 확보되어야
+// GSR z-score baseline을 확정한다.
+const int MIN_GSR_BASELINE_SAMPLES_FOR_Z = 300;
+
 // z-score를 점수화할 때 사용할 scale
-// z=0 -> 50점, z=+1 -> 65점, z=+2 -> 80점, z=+3 -> 95점
-const float Z_SCORE_SCALE = 15.0;
+// PPG의 zToCenteredScore와 동일하게 맞춘다.
+// z=-3 -> 0점, z=0 -> 50점, z=+3 -> 100점
+const float Z_SCORE_SCALE = 50.0 / 3.0;
 
 // =====================
 // Median filter variables
@@ -163,28 +178,22 @@ bool hasValidSignal = false;
 // Baseline statistics for threshold
 // phasic 기준
 // =====================
-float baselinePhasicSum = 0.0;
-float baselinePhasicSqSum = 0.0;
 int baselineCount = 0;
-
 float baselinePhasicMean = 0.0;
+float baselinePhasicM2 = 0.0;
 float baselinePhasicStd = 0.0;
 
 // =====================
 // Baseline statistics for z-score
 // =====================
-float baselineSclSum = 0.0;
-float baselineSclSqSum = 0.0;
 int baselineSclCount = 0;
-
 float baselineSclMean = 0.0;
+float baselineSclM2 = 0.0;
 float baselineSclStd = 0.0;
 
-float baselinePhasicPosSum = 0.0;
-float baselinePhasicPosSqSum = 0.0;
 int baselinePhasicPosCount = 0;
-
 float baselinePhasicPosMean = 0.0;
+float baselinePhasicPosM2 = 0.0;
 float baselinePhasicPosStd = 0.0;
 
 // NS-SCR Frequency는 baseline 안정 상태에서 0에 가깝게 보는 구조
@@ -205,6 +214,11 @@ int windowSampleCount = 0;
 
 float windowScrAmpSum = 0.0;
 int windowScrCount = 0;
+
+// GSR feature window가 REST/TRANSITION/STRESS 경계를 넘어 섞이지 않도록
+// 현재 window가 어떤 mode에서 누적 중인지 별도로 추적한다.
+String activeFeatureWindowMode = "";
+String previousGsrMode = "";
 
 // =====================
 // SCR peak detection variables
@@ -229,6 +243,7 @@ unsigned long currSampleTimeMs = 0;
 // General variables
 // =====================
 unsigned long lastSampleTime = 0;
+unsigned long startTimeMs = 0;
 int sampleIndex = 0;
 
 // =====================
@@ -258,12 +273,30 @@ int latestFeatureReady = 0;
 
 // GSR feature는 30초 window 단위로 갱신되므로, 최근 계산값을 일정 시간 동안만 유효하게 사용한다.
 // 이렇게 하면 새 window가 완성되기 전 출력 공백은 줄이고, 너무 오래된 값이 현재 상태처럼 통합되는 문제는 막을 수 있다.
-const unsigned long GSR_SCORE_FRESHNESS_MS = (FEATURE_WINDOW_SEC + 10UL) * 1000UL;
+const unsigned long GSR_SCORE_FRESHNESS_MS = COMMON_FEATURE_WINDOW_MS + 10000UL;
 unsigned long latestGsrScoreUpdateMs = 0;
 
 bool isLatestScoreFresh(unsigned long nowMs) {
   if (latestGsrScoreUpdateMs == 0) return false;
   return (nowMs - latestGsrScoreUpdateMs) <= GSR_SCORE_FRESHNESS_MS;
+}
+
+void resetFeatureWindowOnly() {
+  windowSclSum = 0.0;
+  windowSampleCount = 0;
+  windowScrAmpSum = 0.0;
+  windowScrCount = 0;
+}
+
+void invalidateLatestGsrScore() {
+  latestFinalGsrStressScore = NAN;
+  latestFeatureReady = 0;
+  latestGsrScoreUpdateMs = 0;
+}
+
+void resetFeatureWindowAndLatestScore() {
+  resetFeatureWindowOnly();
+  invalidateLatestGsrScore();
 }
 
 
@@ -298,21 +331,18 @@ float zToStressScore(float z) {
   return clampFloat(score, 0.0, 100.0);
 }
 
-float calcMean(float sumVal, int countVal) {
-  if (countVal <= 0) return 0.0;
-  return sumVal / countVal;
+void updateWelford(float x, int &countVal, float &meanVal, float &m2Val) {
+  countVal++;
+  float delta = x - meanVal;
+  meanVal += delta / countVal;
+  float delta2 = x - meanVal;
+  m2Val += delta * delta2;
 }
 
-float calcStd(float sumVal, float sqSumVal, int countVal) {
+float welfordSampleStd(float m2Val, int countVal) {
   if (countVal <= 1) return 0.0;
-
-  float meanVal = sumVal / countVal;
-  float variance = (sqSumVal / countVal) - (meanVal * meanVal);
-
-  if (variance < 0.0) {
-    variance = 0.0;
-  }
-
+  float variance = m2Val / (countVal - 1);
+  if (variance < 0.0) variance = 0.0;
   return sqrt(variance);
 }
 
@@ -367,11 +397,24 @@ float updateEmaBaseline(float x) {
   if (!scrBaselineInitialized) {
     scrDetectBaseline = x;
     scrBaselineInitialized = true;
-  } else {
-    scrDetectBaseline =
-      SCR_BASELINE_ALPHA * x +
-      (1.0 - SCR_BASELINE_ALPHA) * scrDetectBaseline;
+    return scrDetectBaseline;
   }
+
+  // CALIBRATION 구간에서는 baseline 자체를 수집하는 단계이므로 EMA를 동결하지 않는다.
+  // baselineReady 이후(REST/STRESS)부터만 SCR 상승 구간에서 EMA baseline이
+  // phasic 성분을 흡수하지 않도록 상승 업데이트를 잠시 동결한다.
+  if (baselineReady) {
+    float residual = x - scrDetectBaseline;
+    float holdThreshold = scrThreshold * 0.7;
+
+    if (residual > holdThreshold) {
+      return scrDetectBaseline;
+    }
+  }
+
+  scrDetectBaseline =
+    SCR_BASELINE_ALPHA * x +
+    (1.0 - SCR_BASELINE_ALPHA) * scrDetectBaseline;
 
   return scrDetectBaseline;
 }
@@ -381,14 +424,19 @@ float updateEmaBaseline(float x) {
 // Baseline finalization
 // =====================
 void finalizeBaseline() {
-  baselinePhasicMean = calcMean(baselinePhasicSum, baselineCount);
-  baselinePhasicStd = calcStd(baselinePhasicSum, baselinePhasicSqSum, baselineCount);
+  // PPG의 baselineMetricCount 검사와 동일한 목적의 GSR baseline 유효성 검사.
+  // GSR은 연속 신호이므로 calibration 구간의 유효 raw/전처리 샘플 수를 기준으로 판단한다.
+  if (baselineCount < MIN_GSR_BASELINE_SAMPLES_FOR_Z ||
+      baselineSclCount < MIN_GSR_BASELINE_SAMPLES_FOR_Z ||
+      baselinePhasicPosCount < MIN_GSR_BASELINE_SAMPLES_FOR_Z) {
+    baselineReady = false;
+    invalidateLatestGsrScore();
+    return;
+  }
 
-  baselineSclMean = calcMean(baselineSclSum, baselineSclCount);
-  baselineSclStd = calcStd(baselineSclSum, baselineSclSqSum, baselineSclCount);
-
-  baselinePhasicPosMean = calcMean(baselinePhasicPosSum, baselinePhasicPosCount);
-  baselinePhasicPosStd = calcStd(baselinePhasicPosSum, baselinePhasicPosSqSum, baselinePhasicPosCount);
+  baselinePhasicStd = welfordSampleStd(baselinePhasicM2, baselineCount);
+  baselineSclStd = welfordSampleStd(baselineSclM2, baselineSclCount);
+  baselinePhasicPosStd = welfordSampleStd(baselinePhasicPosM2, baselinePhasicPosCount);
 
   // SCR detection threshold
   scrThreshold = THRESHOLD_K * baselinePhasicStd;
@@ -536,22 +584,19 @@ void resetAll() {
   hasValidSignal = false;
 
   // Baseline statistics
-  baselinePhasicSum = 0.0;
-  baselinePhasicSqSum = 0.0;
   baselineCount = 0;
   baselinePhasicMean = 0.0;
+  baselinePhasicM2 = 0.0;
   baselinePhasicStd = 0.0;
 
-  baselineSclSum = 0.0;
-  baselineSclSqSum = 0.0;
   baselineSclCount = 0;
   baselineSclMean = 0.0;
+  baselineSclM2 = 0.0;
   baselineSclStd = 0.0;
 
-  baselinePhasicPosSum = 0.0;
-  baselinePhasicPosSqSum = 0.0;
   baselinePhasicPosCount = 0;
   baselinePhasicPosMean = 0.0;
+  baselinePhasicPosM2 = 0.0;
   baselinePhasicPosStd = 0.0;
 
   baselineNsScrFreqMean = 0.0;
@@ -566,6 +611,7 @@ void resetAll() {
   windowSampleCount = 0;
   windowScrAmpSum = 0.0;
   windowScrCount = 0;
+  activeFeatureWindowMode = "";
 
   // SCR peak detection
   phasicPrev2 = 0.0;
@@ -607,6 +653,8 @@ void resetAll() {
   latestFinalGsrStressScore = NAN;
   latestFeatureReady = 0;
   latestGsrScoreUpdateMs = 0;
+  activeFeatureWindowMode = "";
+  previousGsrMode = "";
 }
 
 
@@ -627,16 +675,24 @@ void loop() {
   currSampleTimeMs = now;
 
   String mode;
+  unsigned long elapsedMs = now - startTimeMs;
 
-  if (sampleIndex < WARMUP_SAMPLES) {
+  // PPG와 동일하게 실제 경과 시간 기준으로 mode를 결정한다.
+  // 구간 길이는 공통 타임라인 상수를 참조해 PPG/GSR 불일치를 방지한다.
+  // sampleIndex는 feature window/SCR refractory용으로만 사용한다.
+  const unsigned long restEndMs = COMMON_BASELINE_END_MS + COMMON_REST_TIME_MS;
+  const unsigned long transitionEndMs = restEndMs + COMMON_TRANSITION_TIME_MS;
+  const unsigned long stressEndMs = transitionEndMs + COMMON_STRESS_TIME_MS;
+
+  if (elapsedMs < COMMON_STABILIZING_TIME_MS) {
     mode = "STABILIZING";
-  } else if (sampleIndex < BASELINE_END_SAMPLES) {
+  } else if (elapsedMs < COMMON_BASELINE_END_MS) {
     mode = "CALIBRATION";
-  } else if (sampleIndex < REST_END_SAMPLES) {
+  } else if (elapsedMs < restEndMs) {
     mode = "REST";
-  } else if (sampleIndex < TRANSITION_END_SAMPLES) {
+  } else if (elapsedMs < transitionEndMs) {
     mode = "TRANSITION";
-  } else if (sampleIndex < STRESS_END_SAMPLES) {
+  } else if (elapsedMs < stressEndMs) {
     mode = "STRESS";
   } else {
     mode = "DONE";
@@ -651,6 +707,25 @@ void loop() {
   latestRawGsr = rawGsr;
   latestSampleIndex = sampleIndex;
   latestContactOk = contactOk;
+
+  bool gsrFeatureMode = (mode == "REST" || mode == "TRANSITION" || mode == "STRESS");
+
+  // mode 전환 시에만 GSR feature window를 정리한다.
+  // REST/TRANSITION/STRESS는 각각 자기 구간의 샘플만으로 feature window를 새로 누적한다.
+  // 따라서 TRANSITION에서도 이전 REST hold 값이 아니라, TRANSITION에서 측정된 값만 사용된다.
+  if (mode != previousGsrMode) {
+    if (gsrFeatureMode) {
+      activeFeatureWindowMode = mode;
+      resetFeatureWindowAndLatestScore();
+      resetPeakDetectionBuffer();
+    } else {
+      activeFeatureWindowMode = "";
+      resetFeatureWindowAndLatestScore();
+      resetPeakDetectionBuffer();
+    }
+
+    previousGsrMode = mode;
+  }
 
   float medianGsr = lastMedianGsr;
   float sclBaseline = lastSclBaseline;
@@ -678,8 +753,8 @@ void loop() {
 
   int featureReady = 0;
 
-  // baseline 종료 시점 보장
-  if (!baselineReady && sampleIndex >= BASELINE_END_SAMPLES) {
+  // baseline 종료 시점 보장: sampleIndex가 아니라 실제 경과 시간 기준으로 PPG와 동기화
+  if (!baselineReady && elapsedMs >= COMMON_BASELINE_END_MS) {
     finalizeBaseline();
     resetPeakDetectionBuffer();
   }
@@ -773,29 +848,20 @@ void loop() {
   latestPhasicPos = phasicPos;
   latestValidSampleFlag = validSampleFlag;
 
-  // 새 30초 feature window가 완성되지 않은 샘플에서도, 최근 GSR 점수가 freshness time 안에 있으면 유효 feature로 표시한다.
-  latestFeatureReady = isLatestScoreFresh(now) ? 1 : 0;
-
-  // baseline/monitoring 전환 전에도 최근 feature 값을 강제로 지우지 않는다.
-  // latestGsrScoreUpdateMs가 0이면 freshness check에서 자동으로 제외된다.
+  // 새 30초 feature window가 완성되지 않은 샘플에서는 같은 mode에서 계산된 최근 GSR 점수만
+  // freshness time 안에서 유효 feature로 표시한다. TRANSITION도 별도 mode window로 계산하지만,
+  // label_valid=0이므로 성능 분석/학습에서는 제외한다.
+  latestFeatureReady = (gsrFeatureMode && isLatestScoreFresh(now)) ? 1 : 0;
 
   // Baseline statistics
   if (mode == "CALIBRATION" && validSampleFlag == 1) {
-    baselinePhasicSum += phasic;
-    baselinePhasicSqSum += phasic * phasic;
-    baselineCount++;
-
-    baselineSclSum += sclBaseline;
-    baselineSclSqSum += sclBaseline * sclBaseline;
-    baselineSclCount++;
-
-    baselinePhasicPosSum += phasicPos;
-    baselinePhasicPosSqSum += phasicPos * phasicPos;
-    baselinePhasicPosCount++;
+    updateWelford(phasic, baselineCount, baselinePhasicMean, baselinePhasicM2);
+    updateWelford(sclBaseline, baselineSclCount, baselineSclMean, baselineSclM2);
+    updateWelford(phasicPos, baselinePhasicPosCount, baselinePhasicPosMean, baselinePhasicPosM2);
   }
 
   // SCR peak detection
-  if ((mode == "REST" || mode == "STRESS") && baselineReady && validSampleFlag == 1) {
+  if (gsrFeatureMode && activeFeatureWindowMode == mode && baselineReady && validSampleFlag == 1) {
     phasicPrev2 = phasicPrev1;
     phasicPrev1 = phasicCurr;
     phasicCurr = phasicPos;
@@ -834,7 +900,7 @@ void loop() {
   }
 
   // Feature window
-  if ((mode == "REST" || mode == "STRESS") && baselineReady && validSampleFlag == 1) {
+  if (gsrFeatureMode && activeFeatureWindowMode == mode && baselineReady && validSampleFlag == 1) {
     windowSclSum += sclBaseline;
     windowSampleCount++;
 
@@ -1003,21 +1069,28 @@ void loop() {
 const float FS = 100.0;
 const unsigned long SAMPLE_INTERVAL_MS = 10;
 
-const unsigned long STABILIZING_TIME_MS  = 15000;
-const unsigned long CALIBRATION_TIME_MS  = 60000;
-const unsigned long REST_TIME_MS         = 300000;  // 5분 안정 구간, label 0
-const unsigned long TRANSITION_TIME_MS   = 30000;   // 스트레스 과제 시작 후 30초, 라벨링 제외
-const unsigned long STRESS_TIME_MS       = 270000;  // 스트레스 후반 4분 30초, label 1
+const unsigned long STABILIZING_TIME_MS  = COMMON_STABILIZING_TIME_MS;
+const unsigned long CALIBRATION_TIME_MS  = COMMON_CALIBRATION_TIME_MS;
+const unsigned long REST_TIME_MS         = COMMON_REST_TIME_MS;        // 5분 안정 구간, label 0
+const unsigned long TRANSITION_TIME_MS   = COMMON_TRANSITION_TIME_MS;  // 스트레스 과제 시작 후 30초, 라벨링 제외
+const unsigned long STRESS_TIME_MS       = COMMON_STRESS_TIME_MS;      // 스트레스 후반 4분 30초, label 1
 // 총 측정 시간: 15 + 60 + 300 + 30 + 270 = 675초 (11분 15초)
 
 unsigned long startTime = 0;
 unsigned long lastSampleTime = 0;
 unsigned long lastPrintTime = 0;
+unsigned long lastBleNotifyTime = 0;
 
 // DONE 상태에서 완료 메시지를 한 번만 출력하고, R 명령으로 재시작할 수 있게 하는 플래그
 bool measurementDonePrinted = false;
 
-const unsigned long PRINT_INTERVAL_MS = 1000;
+const unsigned long PRINT_INTERVAL_MS = 2000UL;
+const unsigned long BLE_NOTIFY_INTERVAL_MS = 1000UL;
+
+// BLE 측정 중에는 긴 Serial CSV 출력이 loop timing을 흔들 수 있으므로 기본 비활성화한다.
+// USB Serial CSV 저장/디버깅이 필요할 때만 true로 변경한다.
+const bool ENABLE_SERIAL_CSV = false;
+const bool ENABLE_SERIAL_EVENTS = true;
 
 
 // ===============================
@@ -1169,8 +1242,11 @@ String finalPpgStressLevel = "";
 
 const float MAX_Z_FOR_SCORE = 3.0;
 
-const float NORMAL_THRESHOLD = 33.3;
-const float STRESS_THRESHOLD = 66.7;
+// 50 기준 양방향 점수화용 분류 기준
+// 0~40: baseline보다 안정 방향, 40~60: Normal, 60~75: Mild, 75~100: Stress
+const float RELAXED_THRESHOLD = 40.0;
+const float NORMAL_THRESHOLD = 60.0;  // Mild 시작 기준
+const float STRESS_THRESHOLD = 75.0;  // Stress 시작 기준
 
 const int MIN_BASELINE_METRIC_COUNT_FOR_Z = 20;
 
@@ -1527,6 +1603,13 @@ void updateHrvMetrics() {
 // ===============================
 // 18. PPG z-score 및 최종 스트레스 점수 계산
 // ===============================
+float zToCenteredScore(float stressDirectionZ) {
+  // 50 = baseline 기준, 50 미만 = 안정 방향, 50 초과 = 스트레스 방향
+  float zClamped = clampFloat(stressDirectionZ, -MAX_Z_FOR_SCORE, MAX_Z_FOR_SCORE);
+  float score = 50.0 + (zClamped / MAX_Z_FOR_SCORE) * 50.0;
+  return clampFloat(score, 0.0, 100.0);
+}
+
 String classifyStressLevel(float score) {
   if (isnan(score)) {
     return "";
@@ -1536,8 +1619,10 @@ String classifyStressLevel(float score) {
     return "Stress";
   } else if (score >= NORMAL_THRESHOLD) {
     return "Mild";
-  } else {
+  } else if (score >= RELAXED_THRESHOLD) {
     return "Normal";
+  } else {
+    return "Relaxed";
   }
 }
 
@@ -1559,9 +1644,9 @@ void resetPpgStressScore() {
 
 
 void updatePpgStressScore(String mode) {
-  // REST / STRESS 구간에서만 z-score 기반 최종 점수 계산
-  // TRANSITION은 과제 시작 직후 30초 과도기이므로 라벨링/분석에서 제외
-  if (mode != "REST" && mode != "STRESS") {
+  // REST / TRANSITION / STRESS 구간에서 z-score 기반 점수 계산
+  // TRANSITION은 측정값은 산출하되 label_valid=0으로 라벨링/분석에서 제외한다.
+  if (mode != "REST" && mode != "TRANSITION" && mode != "STRESS") {
     resetPpgStressScore();
     return;
   }
@@ -1596,34 +1681,19 @@ void updatePpgStressScore(String mode) {
   sdnnZ = (sdnn - baselineSDNNMean) / safeSdnnStd;
   rmssdZ = (rmssd - baselineRMSSDMean) / safeRmssdStd;
 
-  // 0~100 스트레스 점수 변환
-  meanHrStressScore = clampFloat((meanHrZ / MAX_Z_FOR_SCORE) * 100.0, 0.0, 100.0);
-  sdnnStressScore = clampFloat((-sdnnZ / MAX_Z_FOR_SCORE) * 100.0, 0.0, 100.0);
-  rmssdStressScore = clampFloat((-rmssdZ / MAX_Z_FOR_SCORE) * 100.0, 0.0, 100.0);
+  // 50 기준 양방향 점수 변환
+  // HR은 증가 방향이 스트레스, SDNN/RMSSD는 감소 방향이 스트레스이므로 부호를 정렬한다.
+  meanHrStressScore = zToCenteredScore(meanHrZ);
+  sdnnStressScore = zToCenteredScore(-sdnnZ);
+  rmssdStressScore = zToCenteredScore(-rmssdZ);
 
-  // 기본 평균 점수
+  // 최종 PPG 점수는 HR, SDNN, RMSSD 세 지표의 단순 평균으로 계산한다.
+  // 이전의 max(ppgAvgScore, hrvScore) 선택 로직은 HRV를 과도하게 강조할 수 있어 제거한다.
   ppgAvgScore = (meanHrStressScore + sdnnStressScore + rmssdStressScore) / 3.0;
+  hrvScore = (sdnnStressScore + rmssdStressScore) / 2.0;  // CSV 확인용 보조값으로만 유지
 
-  // HRV 중심 점수
-  hrvScore = (sdnnStressScore + rmssdStressScore) / 2.0;
-
-  bool rmssdStress = rmssdStressScore >= STRESS_THRESHOLD;
-  bool sdnnStress = sdnnStressScore >= STRESS_THRESHOLD;
-
-  bool rmssdMild = rmssdStressScore >= NORMAL_THRESHOLD;
-  bool sdnnMild = sdnnStressScore >= NORMAL_THRESHOLD;
-
-  // 최종 PPG 점수 결정
-  if (rmssdStress && sdnnStress) {
-    finalPpgStressScore = max(ppgAvgScore, hrvScore);
-    finalPpgStressLevel = "Stress";
-  } else if (rmssdMild && sdnnMild) {
-    finalPpgStressScore = max(ppgAvgScore, hrvScore);
-    finalPpgStressLevel = classifyStressLevel(finalPpgStressScore);
-  } else {
-    finalPpgStressScore = ppgAvgScore;
-    finalPpgStressLevel = classifyStressLevel(finalPpgStressScore);
-  }
+  finalPpgStressScore = ppgAvgScore;
+  finalPpgStressLevel = classifyStressLevel(finalPpgStressScore);
 }
 
 
@@ -1697,15 +1767,16 @@ uint8_t modeToCode(String mode) {
 }
 
 uint8_t levelToCode(String level) {
-  if (level == "Normal") return 1;
-  if (level == "Mild") return 2;
-  if (level == "Stress") return 3;
+  if (level == "Relaxed") return 1;
+  if (level == "Normal") return 2;
+  if (level == "Mild") return 3;
+  if (level == "Stress") return 4;
   return 0;
 }
 
 void setupBle() {
   if (!BLE.begin()) {
-    Serial.println("ERROR,BLE_START_FAILED");
+    if (ENABLE_SERIAL_EVENTS) Serial.println("ERROR,BLE_START_FAILED");
     while (1);
   }
 
@@ -1720,10 +1791,11 @@ void setupBle() {
   featureDataChar.writeValue((uint8_t*)&latestBleFeatures, sizeof(latestBleFeatures));
 
   BLE.advertise();
-  Serial.println("BLE_READY,BioGrip_Feature");
+  if (ENABLE_SERIAL_EVENTS) Serial.println("BLE_READY,BioGrip_Feature");
 }
 
 void updateBleFeatureData(String mode) {
+  latestBleFeatures.seq = bleSeq++;
   latestBleFeatures.mean_hr = isnan(meanHR) ? -1.0 : meanHR;
   latestBleFeatures.final_ppg_stress_score = isnan(finalPpgStressScore) ? -1.0 : finalPpgStressScore;
   latestBleFeatures.final_gsr_stress_score = isnan(gsr::latestFinalGsrStressScore) ? -1.0 : gsr::latestFinalGsrStressScore;
@@ -1750,8 +1822,10 @@ void handleBleCommand() {
   }
 
   uint8_t command = controlPointChar.value();
-  Serial.print("BLE_COMMAND,");
-  Serial.println(command);
+  if (ENABLE_SERIAL_EVENTS) {
+    Serial.print("BLE_COMMAND,");
+    Serial.println(command);
+  }
 
   // 1: 측정 시작 또는 재시작
   if (command == 1) {
@@ -1762,7 +1836,7 @@ void handleBleCommand() {
   // 2: 측정 중지
   else if (command == 2) {
     measurementActive = false;
-    Serial.println("MEASUREMENT_STOPPED_BY_BLE");
+    if (ENABLE_SERIAL_EVENTS) Serial.println("MEASUREMENT_STOPPED_BY_BLE");
   }
 }
 
@@ -1770,12 +1844,12 @@ void handleBleCommand() {
 // ===============================
 // 20. 통합 CSV 출력 함수
 // ===============================
-void printCombinedCsvRow(unsigned long elapsedMs, String mode, long irRaw, float filteredPpg) {
+void updateCombinedStateAndMaybePrint(unsigned long elapsedMs, String mode, long irRaw, float filteredPpg, bool doSerialPrint) {
   float integratedStressScore = NAN;
   String integratedStressLevel = "";
 
-  // 통합 점수는 strict AND 방식이 아니라 조건부 평균 방식으로 계산한다.
-  // PPG와 GSR이 모두 유효하면 두 값을 평균내고, 한쪽만 유효하면 해당 센서 값을 임시 통합값으로 사용한다.
+  // PPG/GSR 개별 점수는 TRANSITION에서도 계산/출력될 수 있다.
+  // 단, 통합 점수와 등급 판정은 라벨이 유효한 REST/STRESS 구간에서만 수행한다.
   bool ppgReady =
     (mode == "REST" || mode == "STRESS") &&
     (validWindowFlag == 1) &&
@@ -1784,7 +1858,8 @@ void printCombinedCsvRow(unsigned long elapsedMs, String mode, long irRaw, float
   bool gsrFresh = gsr::isLatestScoreFresh(millis());
 
   bool gsrReady =
-    (gsr::latestMode == "REST" || gsr::latestMode == "STRESS") &&
+    (mode == "REST" || mode == "STRESS") &&
+    (gsr::latestMode == mode) &&
     (gsr::latestContactOk == 1) &&
     (gsr::latestValidSampleFlag == 1) &&
     gsrFresh &&
@@ -1812,6 +1887,10 @@ void printCombinedCsvRow(unsigned long elapsedMs, String mode, long irRaw, float
   latestIntegratedStressLevel = integratedStressLevel;
   latestPpgReadyForBle = ppgReady;
   latestGsrReadyForBle = gsrReady;
+
+  if (!doSerialPrint) {
+    return;
+  }
 
   Serial.print(elapsedMs);
   Serial.print(",");
@@ -2062,15 +2141,19 @@ void startMeasurement() {
   startTime           = t0;
   lastSampleTime      = t0;
   lastPrintTime       = t0;
+  lastBleNotifyTime   = t0;
   gsr::lastSampleTime = t0;
+  gsr::startTimeMs = t0;
   measurementDonePrinted = false;
   latestIntegratedStressScore = NAN;
   latestIntegratedStressLevel = "";
   latestPpgReadyForBle = false;
   latestGsrReadyForBle = false;
+  bleSeq = 0;
   memset(&latestBleFeatures, 0, sizeof(latestBleFeatures));
 
-  Serial.println(
+  if (ENABLE_SERIAL_CSV) {
+    Serial.println(
     "time_ms,ppg_mode,ir_raw,class_label,label_valid,filtered_ppg,ibi_ms,valid_ibi_ms,"
     "mean_hr,sdnn,rmssd,"
     "baseline_mean_hr_mean,baseline_mean_hr_std,"
@@ -2088,7 +2171,8 @@ void startMeasurement() {
     "scl_stress_score,scr_amplitude_stress_score,ns_scr_frequency_stress_score,"
     "final_gsr_stress_score,gsr_feature_ready,gsr_contact_ok,gsr_valid_sample_flag,"
     "integrated_stress_score,integrated_stress_level"
-  );
+    );
+  }
 }
 
 
@@ -2102,7 +2186,7 @@ void setup() {
   Wire.begin();
 
   if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
-    Serial.println("ERROR,MAX30102_NOT_FOUND");
+    if (ENABLE_SERIAL_EVENTS) Serial.println("ERROR,MAX30102_NOT_FOUND");
     while (1);
   }
 
@@ -2130,7 +2214,7 @@ void setup() {
 
   // PC에서는 기존처럼 'S' 명령을 보내면 시작되고,
   // BLE에서는 Control Point에 1을 쓰면 시작된다.
-  Serial.println("READY");
+  if (ENABLE_SERIAL_EVENTS) Serial.println("READY");
 }
 
 
@@ -2146,13 +2230,13 @@ void loop() {
   if (Serial.available()) {
     char cmd = Serial.read();
     if (cmd == 'S' || cmd == 's' || cmd == 'R' || cmd == 'r') {
-      Serial.println("START");
+      if (ENABLE_SERIAL_EVENTS) Serial.println("START");
       delay(100);
       startMeasurement();
       return;
     } else if (cmd == 'X' || cmd == 'x') {
       measurementActive = false;
-      Serial.println("MEASUREMENT_STOPPED_BY_SERIAL");
+      if (ENABLE_SERIAL_EVENTS) Serial.println("MEASUREMENT_STOPPED_BY_SERIAL");
       return;
     }
   }
@@ -2195,7 +2279,7 @@ void loop() {
   // 그래야 DONE 이후에도 PC에서 R/r 명령을 보내 재측정을 시작할 수 있다.
   if (mode == "DONE") {
     if (!measurementDonePrinted) {
-      Serial.println("MEASUREMENT_DONE");
+      if (ENABLE_SERIAL_EVENTS) Serial.println("MEASUREMENT_DONE");
       measurementDonePrinted = true;
       measurementActive = false;
       notifyBleFeatureData(mode);
@@ -2245,7 +2329,9 @@ void loop() {
             addMedianBuffer(rawIbiMs);
 
             // 3. CALIBRATION 구간 baseline IBI 누적
-            if (mode == "CALIBRATION") {
+            // local median 버퍼가 최소 3개 이상 채워진 뒤부터 baseline IBI에 반영한다.
+            // 초기 1~2개 IBI는 basic range만 통과한 상태라 baseline을 왜곡할 수 있으므로 제외한다.
+            if (mode == "CALIBRATION" && medianCount >= 3) {
               updateBaselineIbi(rawIbiMs);
             }
 
@@ -2291,20 +2377,47 @@ void loop() {
   }
 
 
-  // 1초마다 CSV 형식 출력
+  bool updatedForThisInterval = false;
+  bool resetIbiAfterInterval = false;
+
+  // Serial CSV 출력 타이머. BLE 측정 시에는 ENABLE_SERIAL_CSV=false로 두어 루프 점유를 줄인다.
   if (now - lastPrintTime >= PRINT_INTERVAL_MS) {
     lastPrintTime = now;
 
-    // 출력 직전 현재 HRV와 baseline 기준으로 PPG 스트레스 점수 갱신
     updatePpgStressScore(mode);
+    updateCombinedStateAndMaybePrint(
+      elapsedMs,
+      mode,
+      irRaw,
+      filteredPpg,
+      ENABLE_SERIAL_CSV
+    );
 
-    // PPG + GSR + 통합 스트레스 점수를 한 줄의 CSV로 출력
-    printCombinedCsvRow(elapsedMs, mode, irRaw, filteredPpg);
+    updatedForThisInterval = true;
+    resetIbiAfterInterval = true;
+  }
 
-    // 같은 시점의 핵심 결과를 BLE Notify로 전송
+  // BLE Notify 전용 타이머. Serial CSV 출력과 분리해 BLE 전송 지연을 줄인다.
+  if (now - lastBleNotifyTime >= BLE_NOTIFY_INTERVAL_MS) {
+    lastBleNotifyTime = now;
+
+    if (!updatedForThisInterval) {
+      updatePpgStressScore(mode);
+      updateCombinedStateAndMaybePrint(
+        elapsedMs,
+        mode,
+        irRaw,
+        filteredPpg,
+        false
+      );
+      resetIbiAfterInterval = true;
+    }
+
     notifyBleFeatureData(mode);
+  }
 
-    // 출력 후 다음 1초 구간의 새 IBI만 표시하기 위해 리셋
+  // 다음 interval에서 새로 검출된 IBI만 표시/판단하기 위한 1초 단위 리셋
+  if (resetIbiAfterInterval) {
     rawIbiMs = NAN;
     validIbiMs = NAN;
   }
