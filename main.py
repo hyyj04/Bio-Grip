@@ -20,30 +20,24 @@ from ble_manager import BLEManager
 # ──────────────────────────────────────────
 def send_notification(title: str, message: str) -> None:
     os_name = platform.system()
-
     if os_name == "Darwin":
         try:
             script = f'display notification "{message}" with title "{title}"'
             subprocess.run(["osascript", "-e", script], check=False)
         except Exception as e:
             print(f"[알림 오류 macOS] {e}")
-
     elif os_name == "Windows":
         try:
             from winotify import Notification, audio
-            toast = Notification(
-                app_id="BioClick",
-                title=title,
-                msg=message,
-                duration="short"
-            )
+            toast = Notification(app_id="BioClick", title=title,
+                                 msg=message, duration="short")
             toast.set_audio(audio.Default, loop=False)
             toast.show()
         except ImportError:
             print(f"[알림] {title}: {message}")
+            print("  → pip install winotify 로 설치하세요")
         except Exception as e:
             print(f"[알림 오류 Windows] {e}")
-
     else:
         print(f"[알림] {title}: {message}")
 
@@ -52,7 +46,7 @@ def send_notification(title: str, message: str) -> None:
 # BLE 백그라운드 스레드
 # ──────────────────────────────────────────
 class BLEThread(QThread):
-    connected      = pyqtSignal(bool)   # True=연결, False=끊김
+    connected      = pyqtSignal(bool)
     data_received  = pyqtSignal(float, float, float, float, float, float)
     error_occurred = pyqtSignal(str)
 
@@ -60,7 +54,7 @@ class BLEThread(QThread):
         super().__init__()
         self.ble   = BLEManager(
             data_callback=self._on_data,
-            connected_callback=self._on_connected   # 연결/끊김 콜백 등록
+            connected_callback=self._on_connected
         )
         self._loop = None
 
@@ -76,12 +70,10 @@ class BLEThread(QThread):
             asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
         else:
             self._loop = asyncio.new_event_loop()
-
         asyncio.set_event_loop(self._loop)
         try:
             result = self._loop.run_until_complete(self.ble.scan_and_connect())
             if not result:
-                # 스캔 실패 (장치 못 찾음)
                 self.connected.emit(False)
                 self.error_occurred.emit("장치를 찾지 못했습니다.")
             self._loop.run_forever()
@@ -94,8 +86,7 @@ class BLEThread(QThread):
     def stop(self):
         if self._loop and self._loop.is_running():
             future = asyncio.run_coroutine_threadsafe(
-                self.ble.disconnect(), self._loop
-            )
+                self.ble.disconnect(), self._loop)
             try:
                 future.result(timeout=3)
             except Exception:
@@ -105,7 +96,7 @@ class BLEThread(QThread):
 
 
 # ──────────────────────────────────────────
-# 트레이 아이콘 생성 (아이콘 파일 없어도 동작)
+# 트레이 아이콘 생성
 # ──────────────────────────────────────────
 def make_tray_icon() -> QIcon:
     px = QPixmap(16, 16)
@@ -155,8 +146,7 @@ class MainWindow(QMainWindow):
         self.stress_plot.setYRange(0, 100)
         self.stress_plot.setMaximumHeight(200)
         self.stress_curve = self.stress_plot.plot(
-            pen=pg.mkPen("#f38ba8", width=2)
-        )
+            pen=pg.mkPen("#f38ba8", width=2))
         layout.addWidget(self.stress_plot)
 
         style = ("color: #cdd6f4; font-size: 13px; padding: 6px;"
@@ -199,8 +189,7 @@ class MainWindow(QMainWindow):
         self.btn.setStyleSheet(
             "QPushButton { background-color: #89b4fa; color: #1e1e2e;"
             "border-radius: 6px; font-weight: bold; }"
-            "QPushButton:disabled { background-color: #585b70; color: #6c7086; }"
-        )
+            "QPushButton:disabled { background-color: #585b70; color: #6c7086; }")
         self.btn.clicked.connect(self._toggle_ble)
         layout.addWidget(self.btn)
 
@@ -208,7 +197,6 @@ class MainWindow(QMainWindow):
     def _build_tray(self):
         self.tray = QSystemTrayIcon(make_tray_icon(), self)
         self.tray.setToolTip("BioClick 스트레스 모니터링")
-
         menu = QMenu()
         show_action = QAction("열기", self)
         quit_action = QAction("종료", self)
@@ -217,13 +205,11 @@ class MainWindow(QMainWindow):
         menu.addAction(show_action)
         menu.addSeparator()
         menu.addAction(quit_action)
-
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._on_tray_activated)
         self.tray.show()
 
     def _on_tray_activated(self, reason):
-        # 트레이 아이콘 더블클릭 시 창 열기
         if reason == QSystemTrayIcon.DoubleClick:
             self.show()
             self.activateWindow()
@@ -231,7 +217,6 @@ class MainWindow(QMainWindow):
     # ── UI 업데이트 ───────────────────────────
     def _update_ui(self, hr, ppg_score, gsr_score, final_score, _u1, _u2):
         stress = round(final_score, 1)
-
         self.stress_history     = np.roll(self.stress_history, -1)
         self.stress_history[-1] = stress
         self.stress_curve.setData(self.stress_history)
@@ -256,31 +241,22 @@ class MainWindow(QMainWindow):
             self._send_stress_notification(stress)
 
     def _update_stress_color(self, stress):
-        if stress >= 70:
-            color = "#f38ba8"
-        elif stress >= 40:
-            color = "#f9e2af"
-        else:
-            color = "#a6e3a1"
+        color = "#f38ba8" if stress >= 70 else "#f9e2af" if stress >= 40 else "#a6e3a1"
         self.stress_label.setStyleSheet(
-            f"color: {color}; font-size: 20px; font-weight: bold; padding: 10px;"
-        )
+            f"color: {color}; font-size: 20px; font-weight: bold; padding: 10px;")
 
     def _send_stress_notification(self, stress):
         now = time.time()
         if now - self.last_notification_time >= self.NOTIFICATION_COOLDOWN:
             self.last_notification_time = now
-            send_notification(
-                "BioClick 스트레스 경고",
-                f"스트레스 지수 {stress} — 잠시 휴식을 취하세요."
-            )
-            # 트레이 알림도 함께 표시
-            self.tray.showMessage(
-                "BioClick 스트레스 경고",
-                f"스트레스 지수 {stress} — 잠시 휴식을 취하세요.",
-                QSystemTrayIcon.Warning,
-                3000
-            )
+            msg = f"스트레스 지수 {stress} — 잠시 휴식을 취하세요."
+            if platform.system() == "Darwin":
+                # macOS: 시스템 알림만 사용
+                send_notification("BioClick 스트레스 경고", msg)
+            else:
+                # Windows: 트레이 버블 알림만 사용
+                self.tray.showMessage("BioClick 스트레스 경고", msg,
+                                      QSystemTrayIcon.Warning, 3000)
 
     # ── BLE 연결 / 해제 ───────────────────────
     def _toggle_ble(self):
@@ -294,7 +270,6 @@ class MainWindow(QMainWindow):
         self.btn.setEnabled(False)
         self.status_label.setText("상태: 스캔 중...")
         self.status_label.setStyleSheet("color: #f9e2af; font-size: 11px;")
-
         self.ble_thread = BLEThread()
         self.ble_thread.connected.connect(self._on_ble_connected)
         self.ble_thread.data_received.connect(self._on_ble_data)
@@ -305,15 +280,13 @@ class MainWindow(QMainWindow):
         if self.ble_thread:
             self.ble_thread.stop()
             self.ble_thread.wait(3000)
-
         self.ble_connected = False
         self.ble_thread    = None
         self.btn.setText("BLE 연결")
         self.btn.setEnabled(True)
         self.btn.setStyleSheet(
             "QPushButton { background-color: #89b4fa; color: #1e1e2e;"
-            "border-radius: 6px; font-weight: bold; }"
-        )
+            "border-radius: 6px; font-weight: bold; }")
         self.ble_status_label.setText("BLE\n대기 중")
         self.status_label.setText("상태: 연결 해제됨")
         self.status_label.setStyleSheet("color: #f9e2af; font-size: 11px;")
@@ -325,12 +298,10 @@ class MainWindow(QMainWindow):
             self.btn.setEnabled(True)
             self.btn.setStyleSheet(
                 "QPushButton { background-color: #a6e3a1; color: #1e1e2e;"
-                "border-radius: 6px; font-weight: bold; }"
-            )
+                "border-radius: 6px; font-weight: bold; }")
             self.status_label.setText("상태: 연결됨")
             self.status_label.setStyleSheet("color: #a6e3a1; font-size: 11px;")
         else:
-            # 끊김 or 스캔 실패
             self.ble_connected = False
             self.ble_status_label.setText("BLE\n재연결 중...")
             self.status_label.setText("상태: 재연결 중...")
@@ -347,15 +318,10 @@ class MainWindow(QMainWindow):
         self.btn.setEnabled(True)
 
     def closeEvent(self, event):
-        # X 버튼 클릭 시 트레이로 숨기기 (완전 종료 X)
         event.ignore()
         self.hide()
-        self.tray.showMessage(
-            "BioClick",
-            "트레이에서 계속 실행 중입니다.",
-            QSystemTrayIcon.Information,
-            2000
-        )
+        self.tray.showMessage("BioClick", "트레이에서 계속 실행 중입니다.",
+                              QSystemTrayIcon.Information, 2000)
 
 
 # ──────────────────────────────────────────
@@ -364,10 +330,9 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     if platform.system() == "Windows":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    app.setQuitOnLastWindowClosed(False)  # 창 닫아도 트레이 유지
+    app.setQuitOnLastWindowClosed(False)
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
