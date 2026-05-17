@@ -1,0 +1,358 @@
+"""
+BLE CSV Logger for BioGrip_Feature / Nano 33 BLE integrated PPG+GSR code
+
+This script connects to the Arduino BLE peripheral, writes commands to the
+Control Point characteristic, subscribes to Feature Data notifications, decodes
+21-byte binary packets with a uint16 sequence number, displays them, checks for missed packets,
+and saves them to CSV.
+
+Install:
+  pip install bleak
+
+Run:
+  python save_ble_integrated_csv.py
+
+Commands after connection:
+  s + Enter or Enter : start / restart measurement  -> BLE Control Point writes 0x01
+  x + Enter          : stop measurement             -> BLE Control Point writes 0x02
+  q + Enter          : quit
+
+Expected MCU BLE packet layout, C struct:
+  struct BleFeatureData {
+    uint16_t seq;                  // 2 bytes
+    float mean_hr;                 // 4 bytes
+    float final_ppg_stress_score;  // 4 bytes
+    float final_gsr_stress_score;  // 4 bytes
+    float integrated_stress_score; // 4 bytes
+    uint8_t integrated_level;      // 1 byte
+    uint8_t mode_code;             // 1 byte
+    uint8_t flags;                 // 1 byte
+  }; // total 21 bytes, little-endian on Arduino Nano 33 BLE
+"""
+
+import asyncio
+import csv
+import os
+import struct
+import sys
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional
+
+try:
+    from bleak import BleakClient, BleakError, BleakScanner
+except ImportError:
+    print("bleak가 설치되어 있지 않습니다.")
+    print("터미널에서 먼저 실행하세요: pip install bleak")
+    sys.exit(1)
+
+# =========================
+# BLE settings
+# =========================
+DEVICE_NAME = "BioGrip_Feature"
+SERVICE_UUID = "19B10000-E8F2-537E-4F6C-D104768A1214"
+FEATURE_DATA_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214"   # Arduino -> PC, Notify
+CONTROL_POINT_UUID = "19B10002-E8F2-537E-4F6C-D104768A1214"  # PC -> Arduino, Write
+
+# If automatic discovery is unstable on your PC, put the BLE address here.
+# Example on Windows: ADDRESS = "AA:BB:CC:DD:EE:FF"
+# Usually leave as None and let the script scan by DEVICE_NAME.
+ADDRESS: Optional[str] = None
+
+# =========================
+# CSV settings
+# =========================
+SAVE_DIR = "ble_csv_logs"
+FILE_PREFIX = "ppg_gsr_ble"
+PRINT_EVERY_N_PACKETS = 1
+
+# Arduino ARM boards generally send float as IEEE-754 little-endian.
+# uint16 seq + 4 floats + 3 unsigned bytes = 21 bytes.
+PACKET_STRUCT = struct.Struct("<HffffBBB")
+
+MODE_NAMES = {
+    0: "UNKNOWN",
+    1: "STABILIZING",
+    2: "CALIBRATION",
+    3: "REST",
+    4: "TRANSITION",
+    5: "STRESS",
+    6: "DONE",
+    7: "NO_FINGER",
+}
+
+LEVEL_NAMES = {
+    0: "NONE",
+    1: "Relaxed",
+    2: "Normal",
+    3: "Mild",
+    4: "Stress",
+}
+
+CSV_HEADER = [
+    "pc_time_iso",
+    "elapsed_pc_s",
+    "seq",
+    "missing_since_prev",
+    "total_missing_packets",
+    "mean_hr",
+    "final_ppg_stress_score",
+    "final_gsr_stress_score",
+    "integrated_stress_score",
+    "integrated_level_code",
+    "integrated_level",
+    "mode_code",
+    "mode",
+    "ppg_ready",
+    "gsr_ready",
+    "label_valid",
+    "measuring",
+    "raw_hex",
+]
+
+
+@dataclass
+class BleFeaturePacket:
+    seq: int
+    mean_hr: float
+    final_ppg_stress_score: float
+    final_gsr_stress_score: float
+    integrated_stress_score: float
+    integrated_level_code: int
+    mode_code: int
+    flags: int
+    raw_hex: str
+
+    @property
+    def integrated_level(self) -> str:
+        return LEVEL_NAMES.get(self.integrated_level_code, f"UNKNOWN_{self.integrated_level_code}")
+
+    @property
+    def mode(self) -> str:
+        return MODE_NAMES.get(self.mode_code, f"UNKNOWN_{self.mode_code}")
+
+    @property
+    def ppg_ready(self) -> int:
+        return 1 if (self.flags & 0x01) else 0
+
+    @property
+    def gsr_ready(self) -> int:
+        return 1 if (self.flags & 0x02) else 0
+
+    @property
+    def label_valid(self) -> int:
+        return 1 if (self.flags & 0x04) else 0
+
+    @property
+    def measuring(self) -> int:
+        return 1 if (self.flags & 0x08) else 0
+
+
+def make_output_path() -> str:
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(SAVE_DIR, f"{FILE_PREFIX}_{timestamp}.csv")
+
+
+def decode_packet(data: bytearray) -> BleFeaturePacket:
+    if len(data) != PACKET_STRUCT.size:
+        raise ValueError(f"packet length mismatch: expected {PACKET_STRUCT.size}, got {len(data)}")
+
+    values = PACKET_STRUCT.unpack(bytes(data))
+    return BleFeaturePacket(
+        seq=values[0],
+        mean_hr=values[1],
+        final_ppg_stress_score=values[2],
+        final_gsr_stress_score=values[3],
+        integrated_stress_score=values[4],
+        integrated_level_code=values[5],
+        mode_code=values[6],
+        flags=values[7],
+        raw_hex=bytes(data).hex(" "),
+    )
+
+
+def packet_to_csv_row(packet: BleFeaturePacket, start_time: datetime, missing_since_prev: int, total_missing_packets: int) -> list:
+    now = datetime.now()
+    elapsed = (now - start_time).total_seconds()
+    return [
+        now.isoformat(timespec="milliseconds"),
+        f"{elapsed:.3f}",
+        packet.seq,
+        missing_since_prev,
+        total_missing_packets,
+        f"{packet.mean_hr:.3f}",
+        f"{packet.final_ppg_stress_score:.3f}",
+        f"{packet.final_gsr_stress_score:.3f}",
+        f"{packet.integrated_stress_score:.3f}",
+        packet.integrated_level_code,
+        packet.integrated_level,
+        packet.mode_code,
+        packet.mode,
+        packet.ppg_ready,
+        packet.gsr_ready,
+        packet.label_valid,
+        packet.measuring,
+        packet.raw_hex,
+    ]
+
+
+async def find_device():
+    if ADDRESS:
+        return ADDRESS
+
+    print(f"BLE 장치 검색 중: {DEVICE_NAME}")
+    devices = await BleakScanner.discover(timeout=8.0, service_uuids=[SERVICE_UUID])
+
+    # Some OSes may not expose service UUIDs during scanning, so also match by name.
+    for device in devices:
+        if device.name == DEVICE_NAME:
+            print(f"장치 발견: {device.name} / {device.address}")
+            return device
+
+    print("\n검색된 BLE 장치:")
+    for device in devices:
+        print(f"  - name={device.name!r}, address={device.address}")
+
+    raise RuntimeError(
+        f"{DEVICE_NAME} 장치를 찾지 못했습니다. 보드 전원, BLE_READY 출력, 다른 앱 연결 여부를 확인하세요."
+    )
+
+
+async def write_control_command(client: BleakClient, command: int) -> None:
+    payload = bytes([command])
+
+    # ArduinoBLE BLEWrite normally supports write with response, but fallback is included
+    # for platform/adapter differences.
+    try:
+        await client.write_gatt_char(CONTROL_POINT_UUID, payload, response=True)
+    except Exception:
+        await client.write_gatt_char(CONTROL_POINT_UUID, payload, response=False)
+
+    if command == 1:
+        print("BLE START/RESTART 명령 전송: 0x01")
+    elif command == 2:
+        print("BLE STOP 명령 전송: 0x02")
+    else:
+        print(f"BLE 명령 전송: 0x{command:02X}")
+
+
+async def keyboard_loop(client: BleakClient, stop_event: asyncio.Event) -> None:
+    print("\n명령어:")
+    print("  Enter 또는 s + Enter : 측정 시작/재시작, Control Point에 0x01 전송")
+    print("  x + Enter            : 측정 중지, Control Point에 0x02 전송")
+    print("  q + Enter            : 종료\n")
+
+    while not stop_event.is_set():
+        text = await asyncio.to_thread(input)
+        cmd = text.strip().lower()
+
+        if cmd in {"", "s", "start", "r", "reset"}:
+            await write_control_command(client, 1)
+        elif cmd in {"x", "stop", "2"}:
+            await write_control_command(client, 2)
+        elif cmd in {"q", "quit", "exit"}:
+            stop_event.set()
+            return
+        else:
+            print("알 수 없는 명령입니다. Enter/s=start, x=stop, q=quit")
+
+
+async def main() -> None:
+    output_path = make_output_path()
+    start_time = datetime.now()
+    packet_count = 0
+    bad_packet_count = 0
+    prev_seq: Optional[int] = None
+    total_missing_packets = 0
+
+    device = await find_device()
+
+    print("\nBLE 연결 중...")
+    async with BleakClient(device, services=[SERVICE_UUID]) as client:
+        print(f"연결 완료: {client.is_connected}")
+        print(f"CSV 저장 파일: {output_path}")
+
+        stop_event = asyncio.Event()
+
+        with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(CSV_HEADER)
+            f.flush()
+
+            def notification_handler(sender, data: bytearray):
+                nonlocal packet_count, bad_packet_count, prev_seq, total_missing_packets
+
+                try:
+                    packet = decode_packet(data)
+                except ValueError as e:
+                    bad_packet_count += 1
+                    print(f"경고: BLE 패킷 해석 실패: {e}, raw={bytes(data).hex(' ')}")
+                    return
+
+                missing_since_prev = 0
+                if prev_seq is not None:
+                    seq_delta = (packet.seq - prev_seq) & 0xFFFF
+                    if seq_delta == 0:
+                        print(f"경고: 중복 BLE seq 수신: seq={packet.seq}")
+                    elif seq_delta > 1:
+                        missing_since_prev = seq_delta - 1
+                        total_missing_packets += missing_since_prev
+                        print(
+                            f"경고: BLE 패킷 누락 감지: prev_seq={prev_seq}, "
+                            f"current_seq={packet.seq}, missing={missing_since_prev}, "
+                            f"total_missing={total_missing_packets}"
+                        )
+                prev_seq = packet.seq
+
+                packet_count += 1
+                row = packet_to_csv_row(packet, start_time, missing_since_prev, total_missing_packets)
+                writer.writerow(row)
+
+                if packet_count % 10 == 0:
+                    f.flush()
+
+                if PRINT_EVERY_N_PACKETS > 0 and packet_count % PRINT_EVERY_N_PACKETS == 0:
+                    print(
+                        f"[{packet_count:05d}] "
+                        f"seq={packet.seq:05d} "
+                        f"miss={total_missing_packets:03d} "
+                        f"mode={packet.mode:<12} "
+                        f"HR={packet.mean_hr:7.2f} "
+                        f"PPG={packet.final_ppg_stress_score:6.3f} "
+                        f"GSR={packet.final_gsr_stress_score:6.3f} "
+                        f"INT={packet.integrated_stress_score:6.3f} "
+                        f"LEVEL={packet.integrated_level:<6} "
+                        f"flags=0x{packet.flags:02X}"
+                    )
+
+            await client.start_notify(FEATURE_DATA_UUID, notification_handler)
+            print("Feature Data Notify 구독 시작")
+
+            keyboard_task = asyncio.create_task(keyboard_loop(client, stop_event))
+
+            try:
+                await stop_event.wait()
+            finally:
+                keyboard_task.cancel()
+                try:
+                    await client.stop_notify(FEATURE_DATA_UUID)
+                except BleakError:
+                    pass
+
+        print("\nBLE 연결 종료")
+        print(f"CSV 저장 완료: {output_path}")
+        print(f"저장 패킷 수: {packet_count}")
+        print(f"누락 감지 패킷 수: {total_missing_packets}")
+        print(f"해석 실패 패킷 수: {bad_packet_count}")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n사용자 중단")
+    except Exception as e:
+        print("\n오류가 발생했습니다.")
+        print(e)
+        sys.exit(1)

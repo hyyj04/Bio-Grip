@@ -1,0 +1,1 @@
+﻿time_ms,mode,ir_raw,filtered_ppg,ibi_ms,valid_ibi_ms,mean_hr,sdnn,rmssd,baseline_mean_hr_mean,baseline_mean_hr_std,baseline_sdnn_mean,baseline_sdnn_std,baseline_rmssd_mean,baseline_rmssd_std,ibi_count,baseline_count,no_finger_count,pc_elapsed_sec,analysis_mode
