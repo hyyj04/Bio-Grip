@@ -22,6 +22,7 @@ String sys_integratedStressState = "";
 int   sys_validFeatureCount = 0;
 bool  sys_ppgReadyForBle = false;
 bool  sys_gsrReadyForBle = false;
+unsigned long sys_lastPrintTime = 0;
 
 // ==========================================
 // 2. BLE 설정
@@ -46,7 +47,10 @@ struct BleFeatureData {
 BleFeatureData ble_latestFeatures;
 uint16_t ble_seq = 0;
 unsigned long ble_lastNotifyTime = 0;
-const unsigned long BLE_NOTIFY_INTERVAL_MS = 50000UL; 
+bool ble_firstNotifyDone = false;
+
+const unsigned long BLE_FIRST_NOTIFY_DELAY_MS = 75000UL;  // 첫 전송: 측정 시작 후 75초
+const unsigned long BLE_NOTIFY_INTERVAL_MS    = 60000UL;  // 이후 전송: 60초마다
 
 // ==========================================
 // 3. 공통 유틸리티 및 수학 계산
@@ -233,22 +237,142 @@ float ppg_sqiIbiBuf[10], ppg_sqiAmpBuf[10]; int ppg_sqiCount = 0, ppg_sqiIndex =
 // 6. 초기화 함수
 // ==========================================
 void sys_resetAll() {
-  gsr_medIndex = 0; gsr_medFilled = false; gsr_maIndex = 0; gsr_maCount = 0; gsr_maSum = 0;
-  gsr_scrDetectBaseline = 0; gsr_scrBaselineInitialized = false;
-  gsr_baselineReady = false; gsr_scrThreshold = 6.0; gsr_calibScrCount = 0;
-  gsr_baselineCount = 0; gsr_baselineSclCount = 0; gsr_baselinePhasicPosCount = 0;
-  gsr_featureReady = 0; gsr_finalStressZ = NAN;
-  
-  // 상태 변수 초기화
+  // =========================
+  // 시스템 상태 초기화
+  // =========================
+  sys_csvHeaderPrinted = false;
+  sys_integratedStressZ = NAN;
+  sys_integratedStressState = "";
+  sys_validFeatureCount = 0;
+  sys_ppgReadyForBle = false;
+  sys_gsrReadyForBle = false;
+
+  // =========================
+  // GSR 상태 초기화
+  // =========================
+  gsr_lastSampleTime = 0;
+  gsr_sampleIndex = 0;
+  gsr_latestRawAdc = 0;
+
+  gsr_contactRecoveryCount = 0;
+  gsr_contactOk = 0;
+  gsr_validSampleFlag = 0;
+
+  gsr_medIndex = 0;
+  gsr_medFilled = false;
+
+  gsr_maIndex = 0;
+  gsr_maCount = 0;
+  gsr_maSum = 0.0;
+
+  gsr_scrDetectBaseline = 0.0;
+  gsr_scrBaselineInitialized = false;
+
+  gsr_phasicPrev2 = 0.0;
+  gsr_phasicPrev1 = 0.0;
+  gsr_phasicCurr = 0.0;
+
+  gsr_lastScrSampleIndex = -9999;
+  gsr_scrThreshold = 6.0;
+
+  gsr_baselineCount = 0;
+  gsr_baselinePhasicMean = 0.0;
+  gsr_baselinePhasicM2 = 0.0;
+  gsr_baselinePhasicStd = 0.0;
+
+  gsr_baselineSclCount = 0;
+  gsr_baselineSclMean = 0.0;
+  gsr_baselineSclM2 = 0.0;
+  gsr_baselineSclStd = 0.0;
+
+  gsr_baselinePhasicPosCount = 0;
+  gsr_baselinePhasicPosMean = 0.0;
+  gsr_baselinePhasicPosM2 = 0.0;
+  gsr_baselinePhasicPosStd = 0.0;
+
+  gsr_baselineReady = false;
+
+  gsr_calibScrCount = 0;
+  gsr_baselineNsScrFreqMean = 0.0;
+  gsr_baselineNsScrFreqStd = 2.0;
+
+  gsr_windowSclSum = 0.0;
+  gsr_windowSampleCount = 0;
+  gsr_windowScrAmpSum = 0.0;
+  gsr_windowScrCount = 0;
+
   gsr_activeFeatureWindowMode = "";
   gsr_previousMode = "";
   gsr_latestMode = "STABILIZING";
-  
-  ppg_baselineEma = 0; ppg_baselineInitialized = false; ppg_lastPeakTime = 0;
-  ppg_baselineHRCount = 0; ppg_baselineSDNNCount = 0; ppg_baselineRMSSDCount = 0;
-  ppg_ibiCount = 0; ppg_sqiCount = 0; ppg_validWindowFlag = 0;
-  ppg_finalStressZ = NAN; sys_integratedStressZ = NAN; sys_integratedStressState = "";
-  sys_validFeatureCount = 0;
+
+  gsr_latestSclMean30s = NAN;
+  gsr_latestScrAmplitudeMean30s = NAN;
+  gsr_latestNsScrFrequencyPerMin = NAN;
+
+  gsr_sclStressZ = NAN;
+  gsr_scrAmplitudeStressZ = NAN;
+  gsr_nsScrFrequencyStressZ = NAN;
+  gsr_finalStressZ = NAN;
+
+  gsr_featureReady = 0;
+  gsr_latestScoreUpdateMs = 0;
+
+  // =========================
+  // PPG 상태 초기화
+  // =========================
+  ppg_lastSampleTime = 0;
+  ppg_latestIrRaw = 0;
+  ppg_latestFiltered = NAN;
+
+  ppg_consecutiveNoFinger = 0;
+
+  ppg_baselineEma = 0.0;
+  ppg_baselineInitialized = false;
+
+  ppg_prev2 = 0.0;
+  ppg_prev1 = 0.0;
+  ppg_curr = 0.0;
+  ppg_absEma = 0.0;
+
+  ppg_lastPeakTime = 0;
+
+  ppg_rawIbiMs = NAN;
+  ppg_validIbiMs = NAN;
+
+  ppg_baselineHRCount = 0;
+  ppg_meanHR_m = 0.0;
+  ppg_meanHR_s = 0.0;
+
+  ppg_baselineSDNNCount = 0;
+  ppg_sdnn_m = 0.0;
+  ppg_sdnn_s = 0.0;
+
+  ppg_baselineRMSSDCount = 0;
+  ppg_rmssd_m = 0.0;
+  ppg_rmssd_s = 0.0;
+
+  ppg_baselineMeanHRMean = NAN;
+  ppg_baselineMeanHRStd = NAN;
+  ppg_baselineSDNNMean = NAN;
+  ppg_baselineSDNNStd = NAN;
+  ppg_baselineRMSSDMean = NAN;
+  ppg_baselineRMSSDStd = NAN;
+
+  ppg_meanHR = NAN;
+  ppg_sdnn = NAN;
+  ppg_rmssd = NAN;
+
+  ppg_validWindowFlag = 0;
+
+  ppg_sdnnStressZ = NAN;
+  ppg_rmssdStressZ = NAN;
+  ppg_finalStressZ = NAN;
+
+  ppg_ibiCount = 0;
+  ppg_ibiIndex = 0;
+
+  ppg_sqiCount = 0;
+  ppg_sqiIndex = 0;
 }
 
 // ==========================================
@@ -257,7 +381,6 @@ void sys_resetAll() {
 void gsr_processSample(unsigned long elapsedMs, String mode) {
   gsr_latestMode = mode;
 
-  // [수정 1] GSR Mode Change 로직 추가 (구간 전환 시 Window 초기화 및 모드 설정)
   bool isFeatureMode = (mode == "REST" || mode == "TRANSITION" || mode == "STRESS");
   if (mode != gsr_previousMode) {
     gsr_windowSclSum = 0; 
@@ -355,7 +478,7 @@ void gsr_processSample(unsigned long elapsedMs, String mode) {
     
     bool localPeak = (gsr_phasicPrev1 > gsr_phasicPrev2) && (gsr_phasicPrev1 >= gsr_phasicCurr);
     bool aboveThresh = (gsr_phasicPrev1 >= gsr_scrThreshold);
-    // [수정 2] GSR 최소 상승폭 조건 (MIN_SCR_RISE_ADC) 적용
+    // GSR 최소 상승폭 조건 (MIN_SCR_RISE_ADC) 적용
     bool riseOk = ((gsr_phasicPrev1 - gsr_phasicPrev2) >= gsr_MIN_SCR_RISE_ADC);
 
     bool isPeak = localPeak && aboveThresh && riseOk;
@@ -377,9 +500,9 @@ void gsr_processSample(unsigned long elapsedMs, String mode) {
       gsr_latestScrAmplitudeMean30s = (gsr_windowScrCount > 0) ? (gsr_windowScrAmpSum / gsr_windowScrCount) : 0.0;
       gsr_latestNsScrFrequencyPerMin = gsr_windowScrCount * 2.0;
 
-      gsr_sclStressZ = sys_computeZScore(gsr_latestSclMean30s, gsr_baselineSclMean, gsr_baselineSclStd, 1.0);
-      gsr_scrAmplitudeStressZ = sys_computeZScore(gsr_latestScrAmplitudeMean30s, gsr_baselinePhasicPosMean, gsr_baselinePhasicPosStd, 1.0);
-      gsr_nsScrFrequencyStressZ = sys_computeZScore(gsr_latestNsScrFrequencyPerMin, gsr_baselineNsScrFreqMean, gsr_baselineNsScrFreqStd, 2.0);
+      gsr_sclStressZ = sys_computeZScore(gsr_latestSclMean30s, gsr_baselineSclMean, gsr_baselineSclStd, 5.0);
+      gsr_scrAmplitudeStressZ = sys_computeZScore(gsr_latestScrAmplitudeMean30s, gsr_baselinePhasicPosMean, gsr_baselinePhasicPosStd, 5.0);
+      gsr_nsScrFrequencyStressZ = sys_computeZScore(gsr_latestNsScrFrequencyPerMin, gsr_baselineNsScrFreqMean, gsr_baselineNsScrFreqStd, 5.0);
 
       float zSum = 0; int zCount = 0;
       if (!isnan(gsr_sclStressZ)) { zSum += gsr_sclStressZ; zCount++; }
@@ -585,7 +708,7 @@ void sys_notifyBleFeatureData(String mode) {
 void setup() {
   Serial.begin(115200); Wire.begin();
   if (ppg_sensor.begin(Wire, I2C_SPEED_FAST)) { 
-    ppg_sensor.setup(0x5F, 4, 2, 100, 411, 16384); 
+    ppg_sensor.setup(0x5F, 4, 2, 400, 411, 16384); 
     ppg_sensor.setPulseAmplitudeRed(0x5F); 
     ppg_sensor.setPulseAmplitudeIR(0x5F); 
   }
@@ -602,11 +725,19 @@ void setup() {
 void startMeasurement() { 
   sys_measurementActive = true; 
   sys_resetAll(); 
+
   unsigned long t0 = millis(); 
+
   ppg_startTimeMs = t0; 
   gsr_startTimeMs = t0; 
+
+  ppg_lastSampleTime = t0;
+  gsr_lastSampleTime = t0;
+  sys_lastPrintTime = t0;
+
   ble_seq = 0; 
-  ble_lastNotifyTime = t0; 
+  ble_lastNotifyTime = t0;
+  ble_firstNotifyDone = false; 
 }
 
 void loop() {
@@ -637,15 +768,17 @@ void loop() {
     ppg_processSample(now, elapsedMs, mode); 
   }
 
-  static unsigned long lastPrintTime = 0;
-  if (now - lastPrintTime >= 1000UL) {
-    lastPrintTime = now;
+  if (now - sys_lastPrintTime >= 1000UL) {
+    sys_lastPrintTime = now;
     ppg_updateStressScore(mode);
     sys_updateCombinedStateAndPrint(elapsedMs, mode);
   }
-  
-  if (now - ble_lastNotifyTime >= BLE_NOTIFY_INTERVAL_MS) {
+ 
+  unsigned long currentBleInterval = ble_firstNotifyDone ? BLE_NOTIFY_INTERVAL_MS : BLE_FIRST_NOTIFY_DELAY_MS;
+
+  if (now - ble_lastNotifyTime >= currentBleInterval) {
     ble_lastNotifyTime = now;
+    ble_firstNotifyDone = true;
     sys_notifyBleFeatureData(mode);
   }
 }
